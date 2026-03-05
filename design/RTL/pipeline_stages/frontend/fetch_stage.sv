@@ -28,12 +28,16 @@ module fetch_stage #(
     
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            // On reset, initialize PC to 0 and invalidate output
             pc_current <= 32'h0;
             valid_out <= 1'b0;
         end else if (flush) begin
+            // On flush, update PC to branch target and invalidate output.
+            // This will cause the target instruction to be fetched in the next cycle.
             pc_current <= branch_target;
             valid_out <= 1'b0;
         end else if (!stall && imem_valid) begin
+            // Fetch new instruction if not stalled and instruction memory is valid
             instr_out <= imem_data;
             pc_out <= pc_current;
             valid_out <= 1'b1;
@@ -43,7 +47,8 @@ module fetch_stage #(
         end
     end
     
-    always @(*)
+    //Interface Decoupling and Reserved for potential Address Translation (virtual to physical)
+    always @(*) 
         imem_addr = pc_current;
 
 endmodule

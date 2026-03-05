@@ -1,5 +1,5 @@
 // ============================================================================
-// decode_stage_SEPARATE.sv - Instruction Decode Stage
+// decode_stage.sv - Instruction Decode Stage
 // ============================================================================
 // Decodes instruction opcode, extracts fields, and routes to appropriate unit
 
