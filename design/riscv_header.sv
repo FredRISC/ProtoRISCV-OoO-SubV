@@ -50,6 +50,14 @@ parameter INST_WIDTH = 32;        // Instruction width
 `define VEC_OP_SRL 4'b0111
 `define UNKNOWN_VEC_OP 4'b1111
 
+// Reservation Station Types (for routing in dispatch)
+`define RS_TYPE_NONE 4'b0000
+`define RS_TYPE_ALU  4'b0001
+`define RS_TYPE_MEM  4'b0010
+`define RS_TYPE_MUL  4'b0100
+`define RS_TYPE_DIV  4'b1000
+`define RS_TYPE_VEC  4'b1010
+
 // Instruction types (for routing in dispatch)
 parameter logic [3:0] `IBASE_ALU = 4'h0;       // ADD, SUB, AND, OR, XOR, SLL, SRL, SRA, SLT, SLTU
 parameter logic [3:0] `IBASE_ALU_IMM = 4'h1;  // ADDI, ANDI, ORI, XORI, SLLI, SRLI, SRAI

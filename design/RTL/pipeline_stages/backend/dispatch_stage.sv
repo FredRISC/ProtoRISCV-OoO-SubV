@@ -1,8 +1,8 @@
 // ============================================================================
 // dispatch_stage.sv - Instruction Dispatch to Reservation Stations
 // ============================================================================
-// Routes instructions to appropriate reservation stations, allocates ROB/LSQ
-// entries, and performs register renaming.
+// Routes instructions to appropriate reservation stations based on decoded instruction type, and
+// prepare alu_op and immediate values for execution. Also generates control signals for RS, ROB, and LSQ allocation.
 
 `include "../riscv_header.sv"
 
@@ -28,20 +28,18 @@ module dispatch_stage #(
     input valid_in,
     
     // Register file read
-    input [XLEN-1:0] rs1_value, rs2_value,
-    output [4:0] rs1_addr, rs2_addr,
+    input [XLEN-1:0] rs1_value, rs2_value, // register values
+    output [4:0] rs1_addr, rs2_addr, // register addresses
     
     // Reservation station allocation
     output [3:0] rs_type,  // Which RS to use
-    output rs_alloc_valid,
+    output rs_alloc_valid, // Valid signal for RS allocation
     
     // ROB allocation
-    output rob_alloc_valid,
-    output [5:0] rob_alloc_tag,
+    output rob_alloc_valid, // Valid signal for ROB allocation
     
     // LSQ allocation (for loads/stores)
-    output lsq_alloc_valid,
-    output [3:0] lsq_alloc_tag,
+    output lsq_alloc_valid, // Valid signal for LSQ allocation
     
     // Output instruction fields
     output [XLEN-1:0] src1_value,
@@ -56,7 +54,6 @@ module dispatch_stage #(
     // Extract fields from instruction
     logic [6:0] opcode;
     logic [4:0] rs1, rs2, rd;
-    logic [11:0] imm12;
     logic [3:0] funct3;
     logic [6:0] funct7;
     
@@ -66,7 +63,6 @@ module dispatch_stage #(
     assign rs1 = instr_in[19:15];
     assign rs2 = instr_in[24:20];
     assign funct7 = instr_in[31:25];
-    assign imm12 = instr_in[31:20];
     
     // Pass through register addresses (ID)
     assign rs1_addr = rs1;
@@ -74,14 +70,31 @@ module dispatch_stage #(
     assign dest_reg = rd;
     
     // Pass through source operands
-    assign src1_value = rs1_value;
+    // Mux for src1: LUI uses 0, AUIPC uses PC, others use rs1
+    assign src1_value = (instr_type == `IBASE_LUI)   ? {XLEN{1'b0}} :
+                        (instr_type == `IBASE_AUIPC) ? pc_in :
+                        rs1_value;
     assign src2_value = rs2_value;
 
     // Sign-extend immediate
     logic [XLEN-1:0] imm_extended;
-    assign imm_extended = {{(XLEN-12){imm12[11]}}, imm12};
     assign immediate = imm_extended;
     
+    // Immediate generation based on instruction type
+    always @(*) begin
+        case (instr_type)
+            `IBASE_STORE:  // S-Type
+                imm_extended = {{20{instr_in[31]}}, instr_in[31:25], instr_in[11:7]};
+            `IBASE_BRANCH: // B-Type
+                imm_extended = {{19{instr_in[31]}}, instr_in[31], instr_in[7], instr_in[30:25], instr_in[11:8], 1'b0};
+            `IBASE_LUI, `IBASE_AUIPC: // U-Type
+                imm_extended = {instr_in[31:12], 12'b0};
+            `IBASE_JAL:    // J-Type
+                imm_extended = {{11{instr_in[31]}}, instr_in[31], instr_in[19:12], instr_in[20], instr_in[30:21], 1'b0};
+            default:       // I-Type (ALU_IMM, LOAD, JALR)
+                imm_extended = {{20{instr_in[31]}}, instr_in[31:20]};
+        endcase
+    end
     
     // ALU operation decoding - alu_op is used by functional units to determine operation type
     always @(*) begin
@@ -111,8 +124,8 @@ module dispatch_stage #(
             end else begin
                 alu_op = `UNKNOWN_VEC_OP;
             end
-        end else begin
-            // Scalar ALU Operation Decoding
+        end else if (instr_type == `IBASE_ALU || instr_type == `IBASE_ALU_IMM) begin
+            // Scalar ALU Operation Decoding (R-Type and I-Type)
             case (funct3)
                 `FUNCT3_ADD_SUB: alu_op = (funct7[5] && instr_type != `IBASE_ALU_IMM) ? `ALU_SUB : `ALU_ADD;
                 `FUNCT3_SLL:     alu_op = `ALU_SLL;
@@ -122,30 +135,45 @@ module dispatch_stage #(
                 `FUNCT3_SR:      alu_op = (funct7[5]) ? `ALU_SRA : `ALU_SRL;
                 `FUNCT3_OR:      alu_op = `ALU_OR;
                 `FUNCT3_AND:     alu_op = `ALU_AND;
-                default:         alu_op = `ALU_ADD; // Default for address calcs (LOAD/STORE) and other ops
-                                                   // This is safer than UNKNOWN_ALU_OP, which could fail address generation.
+                default:         alu_op = `ALU_ADD;
             endcase
+        end else if (instr_type == `IBASE_BRANCH) begin
+            // Branch Operation Decoding
+            case (funct3)
+                3'b000, 3'b001: alu_op = `ALU_SUB;  // BEQ, BNE
+                3'b100, 3'b101: alu_op = `ALU_SLT;  // BLT, BGE
+                3'b110, 3'b111: alu_op = `ALU_SLTU; // BLTU, BGEU
+                default:        alu_op = `ALU_SUB;
+            endcase
+        end else if (instr_type == `M_EXT_MUL || instr_type == `M_EXT_DIV) begin
+            // M-Extension Operation Decoding
+            // funct3 maps directly to the operation subtype (MUL, MULH, DIV, REM, etc.)
+            alu_op = {1'b0, funct3};
+        end else begin
+            // Default for Loads, Stores, Jumps, LUI, AUIPC (Address Calculation)
+            // Also covers Vector Load/Store which need base address calculation.
+            alu_op = `ALU_ADD;
         end
     end
 
     // Decode instruction type to determine RS type
     always @(*) begin
         case (instr_type)
-            `IBASE_ALU:      rs_type = 4'b0001;  // ALU_RS
-            `IBASE_ALU_IMM:  rs_type = 4'b0001;  // ALU_RS
-            `IBASE_LOAD:     rs_type = 4'b0010;  // MEM_RS
-            `IBASE_STORE:    rs_type = 4'b0010;  // MEM_RS
-            `IBASE_LUI:      rs_type = 4'b0001;  // ALU_RS
-            `IBASE_AUIPC:    rs_type = 4'b0001;  // ALU_RS
-            `IBASE_JAL:      rs_type = 4'b0001;  // ALU_RS
-            `IBASE_JALR:     rs_type = 4'b0001;  // ALU_RS
-            `IBASE_BRANCH:   rs_type = 4'b0001;  // ALU_RS (for comparison)
-            `M_EXT_MUL:      rs_type = 4'b0100;  // MUL_RS
-            `M_EXT_DIV:      rs_type = 4'b1000;  // DIV_RS
-            `V_EXT_VEC:      rs_type = 4'b1010;  // VEC_RS
-            `V_EXT_LOAD:     rs_type = 4'b0010;  // MEM_RS (Vector Loads go to MEM RS)
-            `V_EXT_STORE:    rs_type = 4'b0010;  // MEM_RS (Vector Stores go to MEM RS)
-            default:         rs_type = 4'b0000;
+            `IBASE_ALU:      rs_type = `RS_TYPE_ALU;
+            `IBASE_ALU_IMM:  rs_type = `RS_TYPE_ALU;
+            `IBASE_LOAD:     rs_type = `RS_TYPE_MEM;
+            `IBASE_STORE:    rs_type = `RS_TYPE_MEM;
+            `IBASE_LUI:      rs_type = `RS_TYPE_ALU;
+            `IBASE_AUIPC:    rs_type = `RS_TYPE_ALU;
+            `IBASE_JAL:      rs_type = `RS_TYPE_ALU;
+            `IBASE_JALR:     rs_type = `RS_TYPE_ALU;
+            `IBASE_BRANCH:   rs_type = `RS_TYPE_ALU; // Branches use ALU for comparison
+            `M_EXT_MUL:      rs_type = `RS_TYPE_MUL;
+            `M_EXT_DIV:      rs_type = `RS_TYPE_DIV;
+            `V_EXT_VEC:      rs_type = `RS_TYPE_VEC;
+            `V_EXT_LOAD:     rs_type = `RS_TYPE_MEM; // Vector Loads go to MEM RS
+            `V_EXT_STORE:    rs_type = `RS_TYPE_MEM; // Vector Stores go to MEM RS
+            default:         rs_type = `RS_TYPE_NONE;
         endcase
     end
     

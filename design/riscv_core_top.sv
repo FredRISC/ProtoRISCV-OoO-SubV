@@ -38,6 +38,8 @@ module riscv_core_top (
     logic [INST_WIDTH-1:0] fetch_instr, decode_instr;
     logic [3:0] decode_instr_type;
     logic fetch_valid, decode_valid, dispatch_valid;
+    logic [3:0] dispatch_rs_type;
+    logic dispatch_rs_alloc, dispatch_rob_alloc, dispatch_lsq_alloc;
     
     // Dispatch outputs
     logic [XLEN-1:0] dispatch_src1, dispatch_src2, dispatch_imm;
@@ -73,7 +75,6 @@ module riscv_core_top (
     logic free_list_valid;
     
     // ROB signals (TRACKING ONLY, not data)
-    logic [4:0] rob_alloc_tag;
     logic rob_full, rob_commit_valid;
     logic [4:0] rob_commit_dest_arch_reg;
     logic [5:0] rob_commit_dest_phys_reg;  // Physical reg holding the result
@@ -139,6 +140,9 @@ module riscv_core_top (
         .commit_arch(rob_commit_dest_arch_reg), .commit_phys(rob_commit_dest_phys_reg),
         .commit_en(rob_commit_valid));
 
+    // Connect Free List allocation to RAT destination
+    assign rat_dst_phys = free_phys_reg;
+
     // ========================================================================
     // PHYSICAL REGISTER FILE (Speculative data storage)
     // ========================================================================
@@ -172,7 +176,10 @@ module riscv_core_top (
         .rs1_value(rs1_value), .rs2_value(rs2_value),
         .src1_value(dispatch_src1), .src2_value(dispatch_src2),
         .immediate(dispatch_imm), .dest_reg(dispatch_dest_reg),
-        .alu_op(dispatch_alu_op), .valid_out(dispatch_valid));
+        .alu_op(dispatch_alu_op), .valid_out(dispatch_valid),
+        .rs_type(dispatch_rs_type), .rs_alloc_valid(dispatch_rs_alloc),
+        .rob_alloc_valid(dispatch_rob_alloc), .lsq_alloc_valid(dispatch_lsq_alloc)
+    );
 
     // ========================================================================
     // RESERVATION STATIONS (All 5 types - routed to execute_stage)
@@ -184,7 +191,7 @@ module riscv_core_top (
         .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
         .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
         .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
-        .dispatch_valid(dispatch_valid && (decode_instr_type == `IBASE_ALU || decode_instr_type == `IBASE_ALU_IMM)),
+        .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_ALU)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(alu_op1), .operand2(alu_op2), .execute_op(alu_operation),
         .execute_valid(alu_valid), .rs_full(alu_rs_full), .assigned_tag(alu_tag));
@@ -195,7 +202,7 @@ module riscv_core_top (
         .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
         .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
         .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
-        .dispatch_valid(dispatch_valid && (decode_instr_type == `IBASE_LOAD || decode_instr_type == `IBASE_STORE)),
+        .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_MEM)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(mem_op1), .operand2(mem_op2), .execute_op(mem_operation),
         .execute_valid(mem_valid), .rs_full(mem_rs_full), .assigned_tag(mem_tag));
@@ -206,7 +213,7 @@ module riscv_core_top (
         .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
         .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
         .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
-        .dispatch_valid(dispatch_valid && (decode_instr_type == `M_EXT_MUL)),
+        .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_MUL)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(mul_op1), .operand2(mul_op2), .execute_op(),
         .execute_valid(mul_valid), .rs_full(mul_rs_full), .assigned_tag(mul_tag));
@@ -217,7 +224,7 @@ module riscv_core_top (
         .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
         .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
         .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
-        .dispatch_valid(dispatch_valid && (decode_instr_type == `M_EXT_DIV)),
+        .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_DIV)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(div_op1), .operand2(div_op2), .execute_op(),
         .execute_valid(div_valid), .rs_full(div_rs_full), .assigned_tag(div_tag));
@@ -228,7 +235,7 @@ module riscv_core_top (
         .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
         .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
         .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
-        .dispatch_valid(dispatch_valid && (decode_instr_type == `V_EXT_VEC)),
+        .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_VEC)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(vec_op1[XLEN-1:0]), .operand2(vec_op2[XLEN-1:0]), .execute_op(vec_operation),
         .execute_valid(vec_valid), .rs_full(vec_rs_full), .assigned_tag(vec_tag));
@@ -241,7 +248,7 @@ module riscv_core_top (
     rob_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
         .alloc_instr_type(decode_instr_type), .alloc_dest_reg(dispatch_dest_reg),
         .alloc_phys_reg(rat_dst_phys),  // NEW: Track physical reg destination
-        .alloc_valid(dispatch_valid), .alloc_tag(rob_alloc_tag), .rob_full(rob_full),
+        .alloc_valid(dispatch_rob_alloc), .alloc_tag(), .rob_full(rob_full),
         .result_data(cdb_result), .result_tag(cdb_tag), .result_valid(cdb_valid),
         .commit_valid(rob_commit_valid), .commit_instr_type(rob_commit_instr_type),
         .commit_dest_arch(rob_commit_dest_arch_reg),
@@ -313,6 +320,9 @@ module riscv_core_top (
     // LSQ stubs
     assign lsq_lq_full = 1'b0;
     assign lsq_sq_full = 1'b0;
-    assign dmem_be = 4'b1111;
+    
+    // Vector operand extension (since RS is 32-bit but VEU is 128-bit)
+    assign vec_op1[VLEN-1:XLEN] = '0;
+    assign vec_op2[VLEN-1:XLEN] = '0;
 
 endmodule
