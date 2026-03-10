@@ -22,10 +22,11 @@ module physical_register_file (
     output logic [XLEN-1:0] read_data1,
     output logic [XLEN-1:0] read_data2,
     
-    // Status bits (when result available)
-    input [5:0] status_wr_addr,
-    input status_wr_en,
-    output logic [NUM_PHYS_REGS-1:0] status_valid  // Bit per physical reg
+    output logic [NUM_PHYS_REGS-1:0] status_valid,  // Bit per physical reg
+    
+    // Allocation (clear valid bit)
+    input [5:0] alloc_addr,
+    input alloc_en
 );
 
     logic [XLEN-1:0] phys_regs [NUM_PHYS_REGS-1:0];
@@ -34,7 +35,8 @@ module physical_register_file (
     // Combinational reads
     assign read_data1 = phys_regs[read_addr1];
     assign read_data2 = phys_regs[read_addr2];
-    assign status_valid = valid_bits;
+    // p0 is always valid (x0 constant)
+    assign status_valid = {valid_bits[NUM_PHYS_REGS-1:1], 1'b1};
     
     // Write on CDB result
     always @(posedge clk or negedge rst_n) begin
@@ -44,10 +46,12 @@ module physical_register_file (
                 valid_bits[i] <= 1'b0;
             end
         end else begin
-            if (write_en)
+            if (write_en) begin
                 phys_regs[write_addr] <= write_data;
-            if (status_wr_en)
-                valid_bits[status_wr_addr] <= 1'b1;
+                valid_bits[write_addr] <= 1'b1; // Set valid when data is written
+            end
+            if (alloc_en)
+                valid_bits[alloc_addr] <= 1'b0; // Clear valid bit on allocation
         end
     end
 

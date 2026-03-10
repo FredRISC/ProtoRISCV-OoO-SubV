@@ -40,6 +40,7 @@ module riscv_core_top (
     logic fetch_valid, decode_valid, dispatch_valid;
     logic [3:0] dispatch_rs_type;
     logic dispatch_rs_alloc, dispatch_rob_alloc, dispatch_lsq_alloc;
+    logic dispatch_src1_is_reg, dispatch_src2_is_reg;
     
     // Dispatch outputs
     logic [XLEN-1:0] dispatch_src1, dispatch_src2, dispatch_imm;
@@ -51,11 +52,11 @@ module riscv_core_top (
     logic [XLEN-1:0] rs1_value, rs2_value;
     
     // RAT signals (Register Alias Table)
-    logic [5:0] rat_src1_phys, rat_src2_phys, rat_dst_phys;
+    logic [5:0] rat_src1_phys, rat_src2_phys, rat_dst_phys, rat_dst_old_phys;
     
     // Physical register file signals
     logic [XLEN-1:0] phys_reg_data1, phys_reg_data2;
-    logic phys_reg_valid1, phys_reg_valid2;
+    logic [NUM_PHYS_REGS-1:0] phys_reg_status;
     
     // RS signals (5 types)
     logic alu_rs_full, mem_rs_full, mul_rs_full, div_rs_full, vec_rs_full;
@@ -78,6 +79,7 @@ module riscv_core_top (
     logic rob_full, rob_commit_valid;
     logic [4:0] rob_commit_dest_arch_reg;
     logic [5:0] rob_commit_dest_phys_reg;  // Physical reg holding the result
+    logic [5:0] rob_commit_old_phys_reg;   // Old physical reg to free
     logic [3:0] rob_commit_instr_type;
     
     // Commit signals
@@ -132,11 +134,12 @@ module riscv_core_top (
     // ========================================================================
     
     rat #(.NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS))
-    rat_inst (.clk(clk), .rst_n(rst_n),
+    rat_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
         .src1_arch(rs1_addr), .src2_arch(rs2_addr),
         .src1_phys(rat_src1_phys), .src2_phys(rat_src2_phys),
         .dst_arch(dispatch_dest_reg), .dst_phys(rat_dst_phys),
-        .rename_en(dispatch_valid),
+        .dst_old_phys(rat_dst_old_phys),
+        .rename_en(dispatch_valid && (dispatch_dest_reg != 5'b0)),
         .commit_arch(rob_commit_dest_arch_reg), .commit_phys(rob_commit_dest_phys_reg),
         .commit_en(rob_commit_valid));
 
@@ -152,8 +155,9 @@ module riscv_core_top (
         .write_addr(cdb_tag), .write_data(cdb_result), .write_en(cdb_valid),
         .read_addr1(rat_src1_phys), .read_addr2(rat_src2_phys),
         .read_data1(phys_reg_data1), .read_data2(phys_reg_data2),
-        .status_wr_addr(cdb_tag), .status_wr_en(cdb_valid),
-        .status_valid());
+        .status_valid(phys_reg_status),
+        .alloc_addr(rat_dst_phys), 
+        .alloc_en(dispatch_valid && (dispatch_dest_reg != 5'b0)));
 
     // ========================================================================
     // FREE LIST (Returns freed physical registers)
@@ -161,9 +165,9 @@ module riscv_core_top (
     
     free_list #(.NUM_PHYS_REGS(NUM_PHYS_REGS), .TAG_WIDTH(6))
     free_list_inst (.clk(clk), .rst_n(rst_n),
-        .alloc_req(dispatch_valid), .alloc_phys(free_phys_reg),
+        .alloc_req(dispatch_valid && (dispatch_dest_reg != 5'b0)), .alloc_phys(free_phys_reg),
         .alloc_valid(free_list_valid),
-        .free_phys(rob_commit_dest_phys_reg), .free_en(rob_commit_valid));
+        .free_phys(rob_commit_old_phys_reg), .free_en(rob_commit_valid && (rob_commit_dest_arch_reg != 5'b0)));
 
     // ========================================================================
     // STAGE 3: DISPATCH
@@ -173,10 +177,11 @@ module riscv_core_top (
     dispatch_inst (.clk(clk), .rst_n(rst_n), .stall(stall_dispatch), .flush(flush_pipeline),
         .instr_in(decode_instr), .instr_type(decode_instr_type), .pc_in(decode_pc), .valid_in(decode_valid),
         .rs1_addr(rs1_addr), .rs2_addr(rs2_addr),
-        .rs1_value(rs1_value), .rs2_value(rs2_value),
+        .rs1_value(phys_reg_data1), .rs2_value(phys_reg_data2), // Read from PRF (Speculative)
         .src1_value(dispatch_src1), .src2_value(dispatch_src2),
         .immediate(dispatch_imm), .dest_reg(dispatch_dest_reg),
         .alu_op(dispatch_alu_op), .valid_out(dispatch_valid),
+        .src1_is_reg(dispatch_src1_is_reg), .src2_is_reg(dispatch_src2_is_reg),
         .rs_type(dispatch_rs_type), .rs_alloc_valid(dispatch_rs_alloc),
         .rob_alloc_valid(dispatch_rob_alloc), .lsq_alloc_valid(dispatch_lsq_alloc)
     );
@@ -188,9 +193,10 @@ module riscv_core_top (
     // ALU RS
     reservation_station #(.RS_SIZE(ALU_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     alu_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
-        .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .alu_op(dispatch_alu_op),
+        .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_ALU)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(alu_op1), .operand2(alu_op2), .execute_op(alu_operation),
@@ -199,9 +205,10 @@ module riscv_core_top (
     // MEM RS
     reservation_station #(.RS_SIZE(MEM_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     mem_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
-        .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .alu_op(dispatch_alu_op),
+        .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_MEM)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(mem_op1), .operand2(mem_op2), .execute_op(mem_operation),
@@ -210,9 +217,10 @@ module riscv_core_top (
     // MUL RS
     reservation_station #(.RS_SIZE(MUL_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     mul_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
-        .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .alu_op(dispatch_alu_op),
+        .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_MUL)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(mul_op1), .operand2(mul_op2), .execute_op(),
@@ -221,9 +229,10 @@ module riscv_core_top (
     // DIV RS
     reservation_station #(.RS_SIZE(DIV_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     div_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
-        .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .alu_op(dispatch_alu_op),
+        .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_DIV)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(div_op1), .operand2(div_op2), .execute_op(),
@@ -232,9 +241,10 @@ module riscv_core_top (
     // VEC RS
     reservation_station #(.RS_SIZE(VEC_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     vec_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(1'b1),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(1'b1),
-        .immediate(dispatch_imm), .alu_op(dispatch_alu_op),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .alu_op(dispatch_alu_op),
+        .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_VEC)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(vec_op1[XLEN-1:0]), .operand2(vec_op2[XLEN-1:0]), .execute_op(vec_operation),
@@ -247,12 +257,14 @@ module riscv_core_top (
     reorder_buffer #(.ROB_SIZE(ROB_SIZE), .XLEN(XLEN))
     rob_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
         .alloc_instr_type(decode_instr_type), .alloc_dest_reg(dispatch_dest_reg),
-        .alloc_phys_reg(rat_dst_phys),  // NEW: Track physical reg destination
+        .alloc_phys_reg(rat_dst_phys),
+        .alloc_old_phys_reg(rat_dst_old_phys),
         .alloc_valid(dispatch_rob_alloc), .alloc_tag(), .rob_full(rob_full),
         .result_data(cdb_result), .result_tag(cdb_tag), .result_valid(cdb_valid),
         .commit_valid(rob_commit_valid), .commit_instr_type(rob_commit_instr_type),
         .commit_dest_arch(rob_commit_dest_arch_reg),
-        .commit_dest_phys(rob_commit_dest_phys_reg),  // NEW: Get phys reg
+        .commit_dest_phys(rob_commit_dest_phys_reg),
+        .commit_old_phys(rob_commit_old_phys_reg),
         .reg_write_en());
 
     // ========================================================================

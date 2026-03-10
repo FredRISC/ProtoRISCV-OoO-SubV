@@ -16,6 +16,8 @@ module reorder_buffer #(
     // Allocation interface (from decode)
     input [3:0] alloc_instr_type,
     input [4:0] alloc_dest_reg,
+    input [5:0] alloc_phys_reg,      // NEW: Physical register allocated
+    input [5:0] alloc_old_phys_reg,  // NEW: Old physical register (to free on commit)
     input alloc_valid,
     output [5:0] alloc_tag,
     output rob_full,
@@ -30,12 +32,16 @@ module reorder_buffer #(
     output [3:0] commit_instr_type,
     output [XLEN-1:0] commit_data,
     output [4:0] commit_dest_reg,
+    output [5:0] commit_dest_phys,   // NEW: Physical register to update Arch RAT
+    output [5:0] commit_old_phys,    // NEW: Old physical register to return to Free List
     output reg_write_en
 );
 
     typedef struct packed {
         logic [3:0] instr_type;
         logic [4:0] dest_reg;
+        logic [5:0] phys_reg;
+        logic [5:0] old_phys_reg;
         logic [XLEN-1:0] result_value;
         logic result_ready;
         logic valid;
@@ -67,6 +73,8 @@ module reorder_buffer #(
         end else if (alloc_valid && !rob_full) begin
             rob_entries[tail_ptr].instr_type <= alloc_instr_type;
             rob_entries[tail_ptr].dest_reg <= alloc_dest_reg;
+            rob_entries[tail_ptr].phys_reg <= alloc_phys_reg;
+            rob_entries[tail_ptr].old_phys_reg <= alloc_old_phys_reg;
             rob_entries[tail_ptr].result_ready <= 1'b0;
             rob_entries[tail_ptr].valid <= 1'b1;
             tail_ptr <= next_tail;
@@ -92,6 +100,8 @@ module reorder_buffer #(
     assign commit_instr_type = rob_entries[head_ptr].instr_type;
     assign commit_data = rob_entries[head_ptr].result_value;
     assign commit_dest_reg = rob_entries[head_ptr].dest_reg;
+    assign commit_dest_phys = rob_entries[head_ptr].phys_reg;
+    assign commit_old_phys = rob_entries[head_ptr].old_phys_reg;
     assign reg_write_en = commit_valid && 
                          (rob_entries[head_ptr].instr_type == `ITYPE_ALU ||
                           rob_entries[head_ptr].instr_type == `ITYPE_ALU_IMM ||

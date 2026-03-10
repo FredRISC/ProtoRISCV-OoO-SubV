@@ -47,8 +47,10 @@ module dispatch_stage #(
     output [XLEN-1:0] immediate,
     output [4:0] dest_reg,
     output [3:0] alu_op,
+    output src1_is_reg, // 1 if src1 is a register, 0 if immediate/PC
+    output src2_is_reg, // 1 if src2 is a register, 0 if immediate
     
-    output reg valid_out
+    output valid_out
 );
 
     // Extract fields from instruction
@@ -63,18 +65,48 @@ module dispatch_stage #(
     assign rs1 = instr_in[19:15];
     assign rs2 = instr_in[24:20];
     assign funct7 = instr_in[31:25];
+
+    // Determine if RS2 is used (register dependency)
+    // Used for: R-Type, Branch, Store, (Vector-scalar not supported now)
+    logic use_rs2;
+    always @(*) begin
+        case (instr_type)
+            `IBASE_ALU, `IBASE_BRANCH, `IBASE_STORE, `M_EXT_MUL, `M_EXT_DIV:
+                use_rs2 = 1'b1;
+            default:
+                use_rs2 = 1'b0;
+        endcase
+    end
+    
+    // Determine if RS1 is used
+    logic use_rs1;
+    always @(*) begin
+        case (instr_type)
+            `IBASE_LUI, `IBASE_AUIPC, `IBASE_JAL: use_rs1 = 1'b0;
+            default: use_rs1 = 1'b1;
+        endcase
+    end
     
     // Pass through register addresses (ID)
-    assign rs1_addr = rs1;
-    assign rs2_addr = rs2;
-    assign dest_reg = rd;
+    assign rs1_addr = (use_rs1) ? rs1 : 5'b0; // Zero out if unused
+    assign rs2_addr = (use_rs2) ? rs2 : 5'b0; // Zero out if unused to prevent false dependency in RAT
+    assign src1_is_reg = use_rs1;
+    assign src2_is_reg = use_rs2;
+    
+    // Only set destination register for instructions that write back; this avoid unecessary register renaming
+    // Stores (S-type) and Branches (B-type) do not write to rd
+    assign dest_reg = (instr_type == `IBASE_STORE || instr_type == `IBASE_BRANCH || instr_type == `V_EXT_STORE) 
+                      ? 5'b0 
+                      : rd;
     
     // Pass through source operands
     // Mux for src1: LUI uses 0, AUIPC uses PC, others use rs1
     assign src1_value = (instr_type == `IBASE_LUI)   ? {XLEN{1'b0}} :
-                        (instr_type == `IBASE_AUIPC) ? pc_in :
+                        (instr_type == `IBASE_AUIPC || instr_type == `IBASE_JAL) ? pc_in :
                         rs1_value;
-    assign src2_value = rs2_value;
+    
+    // Mux for src2: Register value OR Immediate
+    assign src2_value = (use_rs2) ? rs2_value : imm_extended;
 
     // Sign-extend immediate
     logic [XLEN-1:0] imm_extended;
@@ -183,15 +215,6 @@ module dispatch_stage #(
     assign lsq_alloc_valid = (instr_type == `IBASE_LOAD || instr_type == `IBASE_STORE) 
                             && valid_in && !stall && !flush;
     
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            valid_out <= 1'b0;
-        else if (flush)
-            valid_out <= 1'b0;
-        else if (!stall && valid_in)
-            valid_out <= 1'b1;
-        else
-            valid_out <= 1'b0;
-    end
+    assign valid_out = valid_in && !stall && !flush;
 
 endmodule

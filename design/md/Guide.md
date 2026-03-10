@@ -113,7 +113,7 @@ A **RISC-V RV32 out-of-order processor** using **RAT+PHYSICAL renaming** with **
 ### 4.1 Pipeline Stages (7 modules)
 
 ```
-fetch_stage_SEPARATE.sv
+fetch_stage.sv
 ├─ I/O: imem_addr (out) ← Program counter
 │      imem_data (in) ← Instruction from memory
 │      pc_out (out) ← Next PC
@@ -121,7 +121,7 @@ fetch_stage_SEPARATE.sv
 ├─ Internal: PC incrementer, branch target handling
 └─ Latency: 1 cycle
 
-decode_stage_SEPARATE.sv
+decode_stage.sv
 ├─ I/O: instr_in (in) ← From fetch
 │      instr_type_out (out) ← ALU/LOAD/MUL/etc
 │      [extracted fields]
