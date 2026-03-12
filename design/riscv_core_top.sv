@@ -16,12 +16,18 @@ module riscv_core_top (
     input [INST_WIDTH-1:0] imem_data,
     input imem_valid,
     
-    output [XLEN-1:0] dmem_addr,
-    output [XLEN-1:0] dmem_write_data,
+    // Data Memory - Dual Port Assumption
+    // Read Port
+    output [XLEN-1:0] dmem_read_addr,
+    output dmem_read_en,
     input [XLEN-1:0] dmem_read_data,
-    output dmem_we,
+    input dmem_read_valid,
+    
+    // Write Port
+    output [XLEN-1:0] dmem_write_addr,
+    output [XLEN-1:0] dmem_write_data,
+    output dmem_write_en,
     output [3:0] dmem_be,
-    input dmem_valid,
     
     input ext_irq,
     output exception_valid,
@@ -40,16 +46,12 @@ module riscv_core_top (
     logic fetch_valid, decode_valid, dispatch_valid;
     logic [3:0] dispatch_rs_type;
     logic dispatch_rs_alloc, dispatch_rob_alloc, dispatch_lsq_alloc;
-    logic dispatch_src1_is_reg, dispatch_src2_is_reg;
+    logic dispatch_src1_valid, dispatch_src2_valid;
     
     // Dispatch outputs
-    logic [XLEN-1:0] dispatch_src1, dispatch_src2, dispatch_imm;
+    logic [XLEN-1:0] dispatch_src1, dispatch_src2;
     logic [4:0] dispatch_dest_reg;
     logic [3:0] dispatch_alu_op;
-    
-    // Register addressing
-    logic [4:0] rs1_addr, rs2_addr;
-    logic [XLEN-1:0] rs1_value, rs2_value;
     
     // RAT signals (Register Alias Table)
     logic [5:0] rat_src1_phys, rat_src2_phys, rat_dst_phys, rat_dst_old_phys;
@@ -116,10 +118,10 @@ module riscv_core_top (
     // REGISTER FILES (Arch Registers Only)
     // ========================================================================
     
+    // NOTE: Arch Register File is only written on commit. 
+    // Dispatch reads from Physical Register File via RAT mapping.
     register_file #(.NUM_INT_REGS(NUM_INT_REGS), .XLEN(XLEN))
     regfile_inst (.clk(clk), .rst_n(rst_n),
-        .read_addr1(rs1_addr), .read_addr2(rs2_addr),
-        .read_data1(rs1_value), .read_data2(rs2_value),
         .write_addr(reg_write_addr), .write_data(reg_write_data),
         .write_en(reg_write_en), .debug_reg_file(debug_reg_file));
     
@@ -128,23 +130,6 @@ module riscv_core_top (
         .read_addr1(5'b0), .read_addr2(5'b0),
         .read_data1(), .read_data2(),
         .write_addr(5'b0), .write_data(0), .write_en(1'b0));
-
-    // ========================================================================
-    // REGISTER ALIAS TABLE (Maps arch regs to physical regs)
-    // ========================================================================
-    
-    rat #(.NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS))
-    rat_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_arch(rs1_addr), .src2_arch(rs2_addr),
-        .src1_phys(rat_src1_phys), .src2_phys(rat_src2_phys),
-        .dst_arch(dispatch_dest_reg), .dst_phys(rat_dst_phys),
-        .dst_old_phys(rat_dst_old_phys),
-        .rename_en(dispatch_valid && (dispatch_dest_reg != 5'b0)),
-        .commit_arch(rob_commit_dest_arch_reg), .commit_phys(rob_commit_dest_phys_reg),
-        .commit_en(rob_commit_valid));
-
-    // Connect Free List allocation to RAT destination
-    assign rat_dst_phys = free_phys_reg;
 
     // ========================================================================
     // PHYSICAL REGISTER FILE (Speculative data storage)
@@ -173,15 +158,18 @@ module riscv_core_top (
     // STAGE 3: DISPATCH
     // ========================================================================
     
-    dispatch_stage #(.XLEN(XLEN), .INST_WIDTH(INST_WIDTH), .NUM_INT_REGS(NUM_INT_REGS))
+    dispatch_stage #(.XLEN(XLEN), .INST_WIDTH(INST_WIDTH), .NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS))
     dispatch_inst (.clk(clk), .rst_n(rst_n), .stall(stall_dispatch), .flush(flush_pipeline),
         .instr_in(decode_instr), .instr_type(decode_instr_type), .pc_in(decode_pc), .valid_in(decode_valid),
-        .rs1_addr(rs1_addr), .rs2_addr(rs2_addr),
-        .rs1_value(phys_reg_data1), .rs2_value(phys_reg_data2), // Read from PRF (Speculative)
+        .free_phys_reg(free_phys_reg),
+        .commit_arch_reg(rob_commit_dest_arch_reg), .commit_phys_reg(rob_commit_dest_phys_reg), .commit_en(rob_commit_valid),
+        .phys_rs1(rat_src1_phys), .phys_rs2(rat_src2_phys), .phys_rd(rat_dst_phys), .phys_rd_old(rat_dst_old_phys),
+        .PReg_src1_value(phys_reg_data1), .PReg_src2_value(phys_reg_data2), 
+        .PReg_src1_valid_in(phys_reg_status[rat_src1_phys]), .PReg_src2_valid_in(phys_reg_status[rat_src2_phys]),
         .src1_value(dispatch_src1), .src2_value(dispatch_src2),
-        .immediate(dispatch_imm), .dest_reg(dispatch_dest_reg),
+        .dest_reg(dispatch_dest_reg),
         .alu_op(dispatch_alu_op), .valid_out(dispatch_valid),
-        .src1_is_reg(dispatch_src1_is_reg), .src2_is_reg(dispatch_src2_is_reg),
+        .src1_valid(dispatch_src1_valid), .src2_valid(dispatch_src2_valid),
         .rs_type(dispatch_rs_type), .rs_alloc_valid(dispatch_rs_alloc),
         .rob_alloc_valid(dispatch_rob_alloc), .lsq_alloc_valid(dispatch_lsq_alloc)
     );
@@ -193,8 +181,8 @@ module riscv_core_top (
     // ALU RS
     reservation_station #(.RS_SIZE(ALU_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     alu_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(dispatch_src1_valid),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(dispatch_src2_valid),
         .alu_op(dispatch_alu_op),
         .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_ALU)),
@@ -205,8 +193,8 @@ module riscv_core_top (
     // MEM RS
     reservation_station #(.RS_SIZE(MEM_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     mem_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(dispatch_src1_valid),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(dispatch_src2_valid),
         .alu_op(dispatch_alu_op),
         .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_MEM)),
@@ -217,8 +205,8 @@ module riscv_core_top (
     // MUL RS
     reservation_station #(.RS_SIZE(MUL_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     mul_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(dispatch_src1_valid),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(dispatch_src2_valid),
         .alu_op(dispatch_alu_op),
         .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_MUL)),
@@ -229,8 +217,8 @@ module riscv_core_top (
     // DIV RS
     reservation_station #(.RS_SIZE(DIV_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     div_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(dispatch_src1_valid),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(dispatch_src2_valid),
         .alu_op(dispatch_alu_op),
         .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_DIV)),
@@ -241,8 +229,8 @@ module riscv_core_top (
     // VEC RS
     reservation_station #(.RS_SIZE(VEC_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
     vec_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
-        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(!dispatch_src1_is_reg || phys_reg_status[rat_src1_phys]),
-        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(!dispatch_src2_is_reg || phys_reg_status[rat_src2_phys]),
+        .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(dispatch_src1_valid),
+        .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(dispatch_src2_valid),
         .alu_op(dispatch_alu_op),
         .dest_tag_in(rat_dst_phys),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_VEC)),
@@ -282,8 +270,11 @@ module riscv_core_top (
         .div_op1(div_op1), .div_op2(div_op2), .div_valid(div_valid), .div_tag(div_tag),
         .vec_op1(vec_op1), .vec_op2(vec_op2), .vec_operation(vec_operation),
         .vec_valid(vec_valid), .vec_tag(vec_tag),
-        .dmem_addr(dmem_addr), .dmem_write_data(dmem_write_data), .dmem_we(dmem_we),
-        .dmem_be(dmem_be), .dmem_read_data(dmem_read_data), .dmem_valid(dmem_valid),
+        .dmem_read_addr(dmem_read_addr), .dmem_read_en(dmem_read_en), 
+        .dmem_read_data(dmem_read_data), .dmem_read_valid(dmem_read_valid),
+        .dmem_write_addr(dmem_write_addr), .dmem_write_data(dmem_write_data), 
+        .dmem_write_en(dmem_write_en), .dmem_be(dmem_be),
+        .commit_store(rob_commit_valid && rob_commit_instr_type == `IBASE_STORE),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid));
 
     // ========================================================================

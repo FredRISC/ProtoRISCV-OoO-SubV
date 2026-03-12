@@ -3,6 +3,7 @@
 // ============================================================================
 // Routes instructions to appropriate reservation stations based on decoded instruction type, and
 // prepare alu_op and immediate values for execution. Also generates control signals for RS, ROB, and LSQ allocation.
+// long critical path (Decode -> RAT -> PRF -> Dispatch -> RS)
 
 `include "../riscv_header.sv"
 
@@ -10,6 +11,7 @@ module dispatch_stage #(
     parameter XLEN = 32,
     parameter INST_WIDTH = 32,
     parameter NUM_INT_REGS = 32,
+    parameter NUM_PHYS_REGS = 64,
     parameter ALU_RS_SIZE = 8,
     parameter MEM_RS_SIZE = 8,
     parameter MUL_RS_SIZE = 4,
@@ -26,36 +28,41 @@ module dispatch_stage #(
     input [3:0] instr_type,
     input [XLEN-1:0] pc_in,
     input valid_in,
+
+    // RAT Interface (Encapsulated)
+    input [5:0] free_phys_reg,       // From Free List
+    input [4:0] commit_arch_reg,     // From Commit/ROB
+    input [5:0] commit_phys_reg,     // From Commit/ROB
+    input commit_en,                 // From Commit/ROB
     
-    // Register file read
-    input [XLEN-1:0] rs1_value, rs2_value, // register values
-    output [4:0] rs1_addr, rs2_addr, // register addresses
-    
-    // Reservation station allocation
-    output [3:0] rs_type,  // Which RS to use
-    output rs_alloc_valid, // Valid signal for RS allocation
-    
-    // ROB allocation
-    output rob_alloc_valid, // Valid signal for ROB allocation
-    
-    // LSQ allocation (for loads/stores)
-    output lsq_alloc_valid, // Valid signal for LSQ allocation
+    output [5:0] phys_rs1, phys_rs2, // To PRF and RS
+    output [5:0] phys_rd, phys_rd_old, // To RS/ROB and ROB/FreeList
+
+    // Signals from physical register file
+    input [XLEN-1:0] PReg_src1_value, PReg_src2_value, // Physical register values 
+    input PReg_src1_valid_in, PReg_src2_valid_in,      // Physical register valid bits
     
     // Output instruction fields
-    output [XLEN-1:0] src1_value,
-    output [XLEN-1:0] src2_value,
-    output [XLEN-1:0] immediate,
-    output [4:0] dest_reg,
+    output [XLEN-1:0] src1_value, // operand 1 value (register)
+    output [XLEN-1:0] src2_value, // operand 2 value (register or immediate)
     output [3:0] alu_op,
-    output src1_is_reg, // 1 if src1 is a register, 0 if immediate/PC
-    output src2_is_reg, // 1 if src2 is a register, 0 if immediate
+    output src1_valid, // Operand 1 is ready (immediate/PC or valid reg)
+    output src2_valid, // Operand 2 is ready (immediate or valid reg)
     
+    // RS allocation
+    output [3:0] rs_type,  // Which RS to use
+    output rs_alloc_valid, // Valid signal for RS allocation   
+    // ROB allocation
+    output rob_alloc_valid, // Valid signal for ROB allocation
+    // LSQ allocation (for loads/stores)
+    output lsq_alloc_valid, // Valid signal for LSQ allocation
+
     output valid_out
 );
 
     // Extract fields from instruction
     logic [6:0] opcode;
-    logic [4:0] rs1, rs2, rd;
+    logic [4:0] rs1, rs2, rd; // Architectural register addresses
     logic [3:0] funct3;
     logic [6:0] funct7;
     
@@ -66,8 +73,13 @@ module dispatch_stage #(
     assign rs2 = instr_in[24:20];
     assign funct7 = instr_in[31:25];
 
+    logic [4:0] rs1_arch_internal, rs2_arch_internal, dst_arch_internal;
+    // Sign-extend immediate
+    logic [XLEN-1:0] imm_extended;
+
+
     // Determine if RS2 is used (register dependency)
-    // Used for: R-Type, Branch, Store, (Vector-scalar not supported now)
+    // Used for: R-Type, Branch, Store (Vector is on different path)
     logic use_rs2;
     always @(*) begin
         case (instr_type)
@@ -87,30 +99,38 @@ module dispatch_stage #(
         endcase
     end
     
-    // Pass through register addresses (ID)
-    assign rs1_addr = (use_rs1) ? rs1 : 5'b0; // Zero out if unused
-    assign rs2_addr = (use_rs2) ? rs2 : 5'b0; // Zero out if unused to prevent false dependency in RAT
-    assign src1_is_reg = use_rs1;
-    assign src2_is_reg = use_rs2;
+    // Preparing architectural addresses for RAT mapping
+    assign rs1_arch_internal = (use_rs1) ? rs1 : 5'b0; // Zero out if unused
+    assign rs2_arch_internal = (use_rs2) ? rs2 : 5'b0; // Zero out if unused to prevent false dependency in RAT
     
-    // Only set destination register for instructions that write back; this avoid unecessary register renaming
-    // Stores (S-type) and Branches (B-type) do not write to rd
-    assign dest_reg = (instr_type == `IBASE_STORE || instr_type == `IBASE_BRANCH || instr_type == `V_EXT_STORE) 
+    // Preparing destination register for RAT renaming
+    // Avoid unecessary register renaming; stores (S-type) and Branches (B-type) do not write to rd
+    assign dst_arch_internal = (instr_type == `IBASE_STORE || instr_type == `IBASE_BRANCH || instr_type == `V_EXT_STORE) 
                       ? 5'b0 
                       : rd;
-    
-    // Pass through source operands
-    // Mux for src1: LUI uses 0, AUIPC uses PC, others use rs1
+
+    // Internal RAT Instantiation
+    rat #(.NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS))
+    rat_inst (
+        .clk(clk), .rst_n(rst_n), .flush(flush),
+        .src1_arch(rs1_arch_internal), .src2_arch(rs2_arch_internal),
+        .src1_phys(phys_rs1), .src2_phys(phys_rs2),
+        .dst_arch(dst_arch_internal), .dst_phys(free_phys_reg),
+        .dst_old_phys(phys_rd_old),
+        .rename_en(valid_in && !stall && !flush && (dst_arch_internal != 5'b0)),
+        .commit_arch(commit_arch_reg), .commit_phys(commit_phys_reg), .commit_en(commit_en)
+    );
+    assign phys_rd = free_phys_reg; // Pass through allocated tag
+
+    // Preparing inputs for reservation station
+    // Mux for src1: LUI uses 0, AUIPC uses PC, others use PReg value
     assign src1_value = (instr_type == `IBASE_LUI)   ? {XLEN{1'b0}} :
                         (instr_type == `IBASE_AUIPC || instr_type == `IBASE_JAL) ? pc_in :
-                        rs1_value;
-    
+                        PReg_src1_value;
     // Mux for src2: Register value OR Immediate
-    assign src2_value = (use_rs2) ? rs2_value : imm_extended;
-
-    // Sign-extend immediate
-    logic [XLEN-1:0] imm_extended;
-    assign immediate = imm_extended;
+    assign src2_value = (use_rs2) ? PReg_src2_value : imm_extended;
+    assign src1_valid = (use_rs1) ? PReg_src1_valid_in : 1'b1; // Valid if not using reg (imm/pc) or reg is valid
+    assign src2_valid = (use_rs2) ? PReg_src2_valid_in : 1'b1;
     
     // Immediate generation based on instruction type
     always @(*) begin

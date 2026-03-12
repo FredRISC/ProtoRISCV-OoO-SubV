@@ -10,12 +10,6 @@ module register_file (
     input clk,
     input rst_n,
     
-    // Read ports (arch register addressing)
-    input [4:0] read_addr1,
-    input [4:0] read_addr2,
-    output logic [XLEN-1:0] read_data1,
-    output logic [XLEN-1:0] read_data2,
-    
     // Write port (only on commit from physical registers)
     input [4:0] write_addr,
     input [XLEN-1:0] write_data,
@@ -26,10 +20,6 @@ module register_file (
 );
 
     logic [XLEN-1:0] registers [NUM_INT_REGS-1:0];
-    
-    // Combinational reads
-    assign read_data1 = registers[read_addr1];
-    assign read_data2 = registers[read_addr2];
     
     // Sequential writes (only on commit)
     always @(posedge clk or negedge rst_n) begin

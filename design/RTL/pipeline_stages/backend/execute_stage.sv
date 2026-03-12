@@ -47,12 +47,20 @@ module execute_stage #(
     input [3:0] vec_tag,
     
     // Memory interface (from LSU)
-    output [XLEN-1:0] dmem_addr,
-    output [XLEN-1:0] dmem_write_data,
-    output dmem_we,
-    output [3:0] dmem_be,
+    // Read Port
+    output [XLEN-1:0] dmem_read_addr,
+    output dmem_read_en,
     input [XLEN-1:0] dmem_read_data,
-    input dmem_valid,
+    input dmem_read_valid,
+    
+    // Write Port
+    output [XLEN-1:0] dmem_write_addr,
+    output [XLEN-1:0] dmem_write_data,
+    output dmem_write_en,
+    output [3:0] dmem_be,
+    
+    // Commit Signal for Store
+    input commit_store,
     
     // Common Data Bus Output (ONE result per cycle via CDB arbitration)
     output [XLEN-1:0] cdb_result,
@@ -174,24 +182,61 @@ module execute_stage #(
     // Load-Store Unit (Single)
     // ========================================================================
     
-    load_store_unit #(.XLEN(XLEN)) lsu_inst (
+    // AGU (Address Generation Unit)
+    logic [XLEN-1:0] agu_addr;
+    assign agu_addr = mem_op1 + mem_op2;
+
+    // Decode Load/Store (Assuming bit 0 differentiates if ALU_ADD is ambiguous, 
+    // or relying on valid bits from Dispatch if implemented. 
+    // Here we use a placeholder check; in real design Dispatch should send distinct ops)
+    logic is_store, is_load;
+    assign is_store = (mem_operation == 4'b0001); // Example placeholder encoding
+    assign is_load  = (mem_operation == 4'b0000); // Example placeholder encoding
+    
+    // Mask store address to prevent spurious WAR hazards in LSQ
+    logic [XLEN-1:0] lsq_store_addr;
+    assign lsq_store_addr = (mem_valid && is_store) ? agu_addr : {XLEN{1'b0}};
+
+    load_store_queue #(.LSQ_LQ_SIZE(8), .LSQ_SQ_SIZE(8), .XLEN(XLEN)) lsq_inst (
         .clk(clk),
         .rst_n(rst_n),
-        .mem_op1(mem_op1),
-        .mem_op2(mem_op2),
-        .mem_operation(mem_operation),
-        .mem_valid(mem_valid),
-        .mem_tag(mem_tag),
-        .result(lsu_result),
-        .result_tag(lsu_tag),
-        .result_valid(lsu_valid),
-        .dmem_addr(dmem_addr),
-        .dmem_write_data(dmem_write_data),
-        .dmem_we(dmem_we),
-        .dmem_be(dmem_be),
+        .flush(1'b0), // Flush not connected in this context, needs top-level signal
+        
+        // Load interface
+        .load_addr(agu_addr),
+        .load_tag(mem_tag),
+        .load_valid(mem_valid && is_load),
+        .load_data(lsu_result),
+        .load_tag_out(lsu_tag),
+        .load_data_valid(lsu_valid),
+        .load_blocked(), // Connected to hazard detection via top
+        
+        // Store interface
+        .store_addr(lsq_store_addr), // Zeroed if not storing
+        .store_data(mem_op2),        // Store data usually in op2 or needs separate path? 
+                                     // Assuming RS put store data in op2 for STORE ops
+        .store_valid(mem_valid && is_store),
+        .commit_store(commit_store), // Retire store
+        .store_blocked(),            // Connected to hazard detection via top
+        
+        // Memory interface
+        .dmem_read_addr(dmem_read_addr),
+        .dmem_read_en(dmem_read_en),
         .dmem_read_data(dmem_read_data),
-        .dmem_valid(dmem_valid)
+        .dmem_read_valid(dmem_read_valid),
+        
+        .dmem_write_addr(dmem_write_addr),
+        .dmem_write_data(dmem_write_data),
+        .dmem_write_en(dmem_write_en),
+        
+        .flush_pipeline(), // Not connected yet
+        
+        // Status
+        .lsq_lq_full(),
+        .lsq_sq_full()
     );
+    
+    assign dmem_be = 4'b1111; // Default to full word for now
 
     // ========================================================================
     // Vector Execution Unit (Single)

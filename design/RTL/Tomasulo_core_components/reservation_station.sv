@@ -66,6 +66,11 @@ module reservation_station #(
     logic allocatable;
     logic [$clog2(RS_SIZE)-1:0] issue_idx;
     
+    // CDB Buffer to avoid race conditions and missing broadcasts
+    reg [XLEN-1:0] cdb_res_buf;
+    reg [RS_TAG_WIDTH-1:0] cdb_tag_buf;
+    reg cdb_val_buf;
+
     // ========================================================================
     // Entry Allocation
     // ========================================================================
@@ -98,43 +103,65 @@ module reservation_station #(
                 rs_entries[i].dest_tag <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[i].alu_op_val <= 4'b0;
             end
+            cdb_res_buf <= {XLEN{1'b0}};
+            cdb_tag_buf <= {RS_TAG_WIDTH{1'b0}};
+            cdb_val_buf <= 1'b0;
         end else if (flush) begin
             for (int i = 0; i < RS_SIZE; i++) begin
                 rs_entries[i].busy <= 1'b0;
             end
-        end else if (dispatch_valid && !rs_full) begin
-            // Allocate new entry
-            rs_entries[alloc_idx].src1_val <= src1_value;
-            rs_entries[alloc_idx].src2_val <= src2_value;
-            rs_entries[alloc_idx].src1_tag_val <= src1_tag;
-            rs_entries[alloc_idx].src2_tag_val <= src2_tag;
-            rs_entries[alloc_idx].src1_ready <= src1_valid;
-            rs_entries[alloc_idx].src2_ready <= src2_valid;
-            rs_entries[alloc_idx].dest_tag <= dest_tag_in;
-            rs_entries[alloc_idx].alu_op_val <= alu_op;
-            rs_entries[alloc_idx].busy <= 1'b1;
-        end
-    end
-    
-    // ========================================================================
-    // Operand Forwarding from CDB
-    // ========================================================================
-    
-    always @(posedge clk) begin
-        if (cdb_valid) begin
-            for (int i = 0; i < RS_SIZE; i++) begin
-                if (rs_entries[i].busy && !rs_entries[i].src1_ready) begin
-                    if (rs_entries[i].src1_tag_val == cdb_tag) begin
-                        rs_entries[i].src1_val <= cdb_result;
-                        rs_entries[i].src1_ready <= 1'b1;
+            cdb_val_buf <= 1'b0;
+        end else begin
+            // 1. Buffer CDB result (capture transient signal) 
+            cdb_res_buf <= cdb_result; // Cycle N
+            cdb_tag_buf <= cdb_tag; // Cycle N
+            cdb_val_buf <= cdb_valid; // Cycle N
+
+            // 2. Update waiting entries using BUFFERED CDB result; 
+            if (cdb_val_buf) begin // Cycle N+1
+                for (int i = 0; i < RS_SIZE; i++) begin
+                    if (rs_entries[i].busy) begin
+                        if (!rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == cdb_tag_buf) begin
+                            rs_entries[i].src1_val <= cdb_res_buf;
+                            rs_entries[i].src1_ready <= 1'b1;
+                        end
+                        if (!rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == cdb_tag_buf) begin
+                            rs_entries[i].src2_val <= cdb_res_buf;
+                            rs_entries[i].src2_ready <= 1'b1;
+                        end
                     end
                 end
-                if (rs_entries[i].busy && !rs_entries[i].src2_ready) begin
-                    if (rs_entries[i].src2_tag_val == cdb_tag) begin
-                        rs_entries[i].src2_val <= cdb_result;
-                        rs_entries[i].src2_ready <= 1'b1;
-                    end
+            end
+
+            // 3. Dispatch - Allocate new entry
+            if (dispatch_valid && !rs_full) begin // Cycle N
+                // Set constant fields
+                rs_entries[alloc_idx].alu_op_val <= alu_op;
+                rs_entries[alloc_idx].dest_tag <= dest_tag_in;
+                rs_entries[alloc_idx].busy <= 1'b1;
+
+                // Handle Src1
+                if (src1_valid) begin
+                    rs_entries[alloc_idx].src1_val <= src1_value;
+                    rs_entries[alloc_idx].src1_ready <= 1'b1;
+                end else begin
+                    rs_entries[alloc_idx].src1_tag_val <= src1_tag;
+                    rs_entries[alloc_idx].src1_ready <= 1'b0;
                 end
+
+                // Handle Src2
+                if (src2_valid) begin
+                    rs_entries[alloc_idx].src2_val <= src2_value;
+                    rs_entries[alloc_idx].src2_ready <= 1'b1;
+                end else begin
+                    rs_entries[alloc_idx].src2_tag_val <= src2_tag;
+                    rs_entries[alloc_idx].src2_ready <= 1'b0;
+                end
+            end
+
+            // 4. Execution - Free issued entry
+            if (execute_valid) begin
+                rs_entries[issue_idx].busy <= 1'b0;
             end
         end
     end
@@ -170,13 +197,6 @@ module reservation_station #(
     assign operand1 = rs_entries[issue_idx].src1_val;
     assign operand2 = rs_entries[issue_idx].src2_val;
     assign execute_op = rs_entries[issue_idx].alu_op_val;
-    
-    // Mark entry as free after execution
-    always @(posedge clk) begin
-        if (execute_valid) begin
-            rs_entries[issue_idx].busy <= 1'b0;
-        end
-    end
     
     // ========================================================================
     // Status Signals

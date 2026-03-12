@@ -13,7 +13,7 @@ module free_list (
     
     // Allocate a free physical register
     input alloc_req,
-    output logic [5:0] alloc_phys,     // Physical reg ID to use
+    output logic [5:0] alloc_phys,     // allocate Physical reg ID to use
     output logic alloc_valid,          // Is one available?
     
     // Free a physical register (on commit)
