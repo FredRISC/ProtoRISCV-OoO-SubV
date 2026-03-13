@@ -7,31 +7,36 @@
 `include "../riscv_header.sv"
 
 module load_store_queue #(
-    parameter LSQ_LQ_SIZE = 8,
-    parameter LSQ_SQ_SIZE = 8,
+    parameter LSQ_SIZE = 16,
     parameter XLEN = 32
 ) (
     input clk,
     input rst_n,
     input flush,
+
+    // 1. Dispatch Allocation Interface (In-Order)
+    input alloc_req,
+    input alloc_is_store,
+    input [5:0] dispatch_phys_tag, // Phys tag of the instruction to be sent to CDB
+    output logic [LSQ_TAG_WIDTH-1:0] alloc_tag, // queue entry's id sent to dispatch_stage for matching after addr calculation
+    output lsq_full,
     
-    // Load interface
-    input [XLEN-1:0] load_addr,
-    input [5:0] load_tag,
-    input load_valid,
-    output logic [XLEN-1:0] load_data,
-    output logic [5:0] load_tag_out,
-    output logic load_data_valid,
-    output load_blocked,
+    // 2. Execution Interface (Out-of-Order Address Calculation)
+    input [XLEN-1:0] exe_addr,			// Calculated address
+    input [XLEN-1:0] exe_data,      // Store data
+    input [LSQ_TAG_WIDTH-1:0] exe_lsq_tag, // Which entry to update? = earlier sent alloc_tag 
+    input exe_load_valid,
+    input exe_store_valid,
     
-    // Store interface
-    input [XLEN-1:0] store_addr,
-    input [XLEN-1:0] store_data,
-    input store_valid,
-    input commit_store, // From ROB/Commit: Retire the oldest store
-    output store_blocked,
+    // 3. CDB Interface
+    output logic [XLEN-1:0] load_data, // Data to CDB 
+    output logic [5:0] cdb_phys_tag_out, // Physical tag for CDB
+    output logic load_data_valid, // CDB input is valid
     
-    // Dual Memory Interface
+    // 4. Commit Interface
+    input commit_lsq, // From ROB/Commit: Retire the oldest load/store
+    
+    // 5. Dual Memory Interface
     // Read Port
     output logic [XLEN-1:0] dmem_read_addr,
     output logic dmem_read_en,
@@ -43,72 +48,47 @@ module load_store_queue #(
     output logic [XLEN-1:0] dmem_write_data,
     output logic dmem_write_en,
     
-    // Disambiguation
+    // 6. Disambiguation (Speculative Load)
     output logic flush_pipeline, // Asserted if store-load ordering violation detected
     
-    // Status
-    output lsq_lq_full,
-    output lsq_sq_full
+    // 7. Status (retained outputs for compatibility, logic internal)
+    output load_blocked,
+    output store_blocked
 );
 
     // ========================================================================
-    // Load Queue Entry & Store Queue Entry
+    // Unified Queue Entry Structure
     // ========================================================================
     typedef struct packed {
-        logic [XLEN-1:0] address;
-        logic [5:0] tag;
+        logic is_store;
+        logic [XLEN-1:0] address;       
+        logic [XLEN-1:0] data;          // Data to store, or data loaded
+        logic [5:0] phys_tag; // Physical tag
+        logic addr_valid;     // Is address calculated?
+        logic data_valid;     // Is data ready? (Loaded from mem/fwd, or computed for store)
         logic valid;
-        logic complete;
         logic sent_to_mem; // Track if request sent to memory (MSHR behavior)
-        logic forwarded;
-    } lq_entry_t;
+        logic committed;   // Ready to retire/write to memory
+    } lsq_entry_t;
     
-    typedef struct packed {
-        logic [XLEN-1:0] address;
-        logic [XLEN-1:0] data;
-        logic valid;
-        logic complete;
-        logic committed; // Ready to write to memory        
-    } sq_entry_t;
+    lsq_entry_t lsq [LSQ_SIZE-1:0]; 
     
-    lq_entry_t load_queue [LSQ_LQ_SIZE-1:0]; // Circular buffer for load queue
-    sq_entry_t store_queue [LSQ_SQ_SIZE-1:0]; // Circular buffer for store queue
+    logic [LSQ_TAG_WIDTH-1:0] head, tail, commit_ptr;
+    logic [LSQ_TAG_WIDTH-1:0] next_tail;
     
-    logic [$clog2(LSQ_LQ_SIZE)-1:0] lq_head, lq_tail; // Pointers for load queue
-    logic [$clog2(LSQ_SQ_SIZE)-1:0] sq_head, sq_tail; // Pointers for store queue
+    assign next_tail = tail + 1;
     
-    // ========================================================================
-    // Allocation-Time Forwarding (All valid Store in SQ are older than the new Load)
-    // ========================================================================   
-    logic [XLEN-1:0] forwarded_data;
-    logic forwarding_valid;
-    
-    always @(*) begin
-        forwarding_valid = 1'b0;
-        forwarded_data = 0;
-        
-        // Check if load address matches any pending store (store-to-load forwarding)
-        // Iterate BACKWARDS from Tail to Head to find the YOUNGEST match first.
-        // Note: This allocation logic assumes in-order allocation (Tail is youngest).
-        for (int i = 0; i < LSQ_SQ_SIZE; i++) begin
-            // Use automatic width for loop variable to avoid truncation warnings
-            // Calculate circular pointer backwards: (tail - 1 - i) % SIZE
-            logic [$clog2(LSQ_SQ_SIZE)-1:0] ptr = (sq_tail - 1 - i[$clog2(LSQ_SQ_SIZE)-1:0]);
-            if (store_queue[ptr].valid && (store_queue[ptr].address == load_addr)) begin
-                forwarded_data = store_queue[ptr].data;
-                forwarding_valid = 1'b1;
-                break; // Found the youngest match, stop searching
-            end
-        end
-    end
+    // Output Allocation Tags (to Dispatch)
+    assign alloc_tag = tail;
+    assign lsq_full = (next_tail == head) && lsq[tail].valid;
+    assign load_blocked = 1'b0; 
+    assign store_blocked = 1'b0;
     
     // ========================================================================
     // Memory Read Arbiter (MSHR Logic)
     // ========================================================================
-    // Selects the OLDEST pending load that hasn't been sent to memory yet.
-    // This allows FCFS handling of cache misses.
     
-    logic [$clog2(LSQ_LQ_SIZE)-1:0] issue_load_idx;
+    logic [LSQ_TAG_WIDTH-1:0] issue_load_idx;
     logic issue_load_valid;
     
     always @(*) begin
@@ -118,174 +98,174 @@ module load_store_queue #(
         dmem_read_en = 1'b0;
         
         // Scan from Head (Oldest) to Tail
-        for (int i = 0; i < LSQ_LQ_SIZE; i++) begin
-            logic [$clog2(LSQ_LQ_SIZE)-1:0] ptr = lq_head + i[$clog2(LSQ_LQ_SIZE)-1:0];
+        for (int i = 0; i < LSQ_SIZE; i++) begin
+            logic [LSQ_TAG_WIDTH-1:0] ptr = head + i[LSQ_TAG_WIDTH-1:0];
+            if (ptr == tail) break; // Stop at valid entries
             
-            // If valid, not complete, not forwarded, and not yet sent to memory
-            if (load_queue[ptr].valid && !load_queue[ptr].complete && 
-                !load_queue[ptr].forwarded && !load_queue[ptr].sent_to_mem) begin
-                
-                issue_load_idx = ptr;
-                issue_load_valid = 1'b1;
-                dmem_read_addr = load_queue[ptr].address;
-                dmem_read_en = 1'b1;
-                break; // Found oldest
+            if (lsq[ptr].valid && !lsq[ptr].is_store && lsq[ptr].addr_valid && 
+                !lsq[ptr].data_valid && !lsq[ptr].sent_to_mem) begin
+                issue_load_idx = ptr; // record the issued idx
+                issue_load_valid = 1'b1; 
+                dmem_read_addr = lsq[ptr].address; 
+                dmem_read_en = 1'b1; 
+                break; // Issue one load per cycle
             end
         end
     end
 
     // ========================================================================
-    // Memory Write Arbiter (Retirement Logic)
+    // Execution: Disambiguation & Forwarding Logic
     // ========================================================================
-    // Only writes to memory when the store at HEAD is committed.
-    
-    always @(*) begin
-        dmem_write_en = 1'b0;
-        dmem_write_addr = 0;
-        dmem_write_data = 0;
-        
-        // Store at head is valid, executed (complete), and committed?
-        // Note: commit_store signal retires the head. The actual memory write
-        // happens on the entry at sq_head if valid.
-        if (store_queue[sq_head].valid && store_queue[sq_head].committed) begin
-            dmem_write_en = 1'b1;
-            dmem_write_addr = store_queue[sq_head].address;
-            dmem_write_data = store_queue[sq_head].data;
-        end
-    end
-
-    // ========================================================================
-    // WAR/Memory Disambiguation Check
-    // ========================================================================
+    logic [XLEN-1:0] forwarded_data;
+    logic forwarding_valid;
     
     always @(*) begin
         flush_pipeline = 1'b0;
+        forwarding_valid = 1'b0;
+        forwarded_data = 0;
         
-        // Disambiguation placeholder:
-        // Check if any YOUNGER load to same address has already executed/completed.
-        // This requires accurate age tracking relative to the store.
+        if (exe_store_valid) begin
+            // 1. DISAMBIGUATION (Store Executed)
+            // Check all YOUNGER loads (from exe_lsq_tag + 1 to tail).
+            for (int k = 1; k < LSQ_SIZE; k++) begin
+                logic [LSQ_TAG_WIDTH-1:0] ptr = exe_lsq_tag + k[LSQ_TAG_WIDTH-1:0];
+                if (ptr == tail) break; // Checked all younger
+                
+                // If it's a speculative load that already fetched data from this address
+                if (lsq[ptr].valid && !lsq[ptr].is_store && lsq[ptr].addr_valid && lsq[ptr].data_valid) begin
+                    if (lsq[ptr].address == exe_addr) begin
+                        flush_pipeline = 1'b1;
+                    end
+                end
+            end
+        end else if (exe_load_valid) begin
+            // 2. FORWARDING (Load Executed)
+            // Scan backwards from load (exe_lsq_tag - 1) to head for the newest older store
+            for (int k = 1; k < LSQ_SIZE; k++) begin
+                logic [LSQ_TAG_WIDTH-1:0] ptr = exe_lsq_tag - k[LSQ_TAG_WIDTH-1:0];
+                
+                if (lsq[ptr].valid && lsq[ptr].is_store && lsq[ptr].addr_valid) begin
+                    if (lsq[ptr].address == exe_addr) begin
+                        // Found the youngest older store.
+                        // Since RS waits for both operands to issue a store, its data is ready!
+                        forwarded_data = lsq[ptr].data;
+                        forwarding_valid = 1'b1;
+                        break;
+                    end
+                end
+                if (ptr == head) break; // Reached the oldest entry
+            end
+        end
     end
     
     // ========================================================================
-    // Queue Management
+    // State Updates (Allocation, Memory Return, Commit, Retirement)
     // ========================================================================
     
-    // Track which load is currently being serviced by memory
-    logic [$clog2(LSQ_LQ_SIZE)-1:0] mem_inflight_load_idx;
+    logic [LSQ_TAG_WIDTH-1:0] mem_inflight_idx;
     logic mem_inflight_valid;
     
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush) begin
-            for (int i = 0; i < LSQ_LQ_SIZE; i++) begin
-                load_queue[i].valid <= 1'b0;
-                load_queue[i].sent_to_mem <= 1'b0;
+            for (int i = 0; i < LSQ_SIZE; i++) begin
+                lsq[i].valid <= 1'b0;
             end
-            for (int i = 0; i < LSQ_SQ_SIZE; i++) begin
-                store_queue[i].valid <= 1'b0;
-                store_queue[i].committed <= 1'b0;
-            end
-            lq_head <= 0;
-            lq_tail <= 0;
-            sq_head <= 0;
-            sq_tail <= 0;
+            head <= 0;
+            tail <= 0;
+            commit_ptr <= 0;
             mem_inflight_valid <= 1'b0;
         end else begin
             
-            // --- LOAD QUEUE ---
+            // 1. Allocation (Dispatch)
+            if (alloc_req && !lsq_full) begin
+                lsq[tail].valid <= 1'b1;
+                lsq[tail].is_store <= alloc_is_store;
+                lsq[tail].phys_tag <= dispatch_phys_tag;
+                lsq[tail].addr_valid <= 1'b0;
+                lsq[tail].data_valid <= 1'b0;
+                lsq[tail].sent_to_mem <= 1'b0;
+                lsq[tail].committed <= 1'b0;
+                tail <= next_tail;
+            end
             
-            // Allocate load queue entry
-            if (load_valid && !lsq_lq_full) begin
-                load_queue[lq_tail].address <= load_addr; // Set address
-                load_queue[lq_tail].tag <= load_tag;      // Set tag
-                load_queue[lq_tail].valid <= 1'b1; // Mark valid
+            // 2. Execution (Address Calculation)
+            if (exe_load_valid) begin
+                lsq[exe_lsq_tag].address <= exe_addr;
+                lsq[exe_lsq_tag].addr_valid <= 1'b1;
                 
-                if (forwarding_valid) begin // If already forwarded, mark complete immediately
-                    load_queue[lq_tail].complete <= 1'b1;
-                    load_queue[lq_tail].forwarded <= 1'b1;
-                    load_queue[lq_tail].sent_to_mem <= 1'b0;
-                end else begin // Otherwise, wait for data to arrive in future cycles
-                    load_queue[lq_tail].complete <= 1'b0;
-                    load_queue[lq_tail].forwarded <= 1'b0;
-                    load_queue[lq_tail].sent_to_mem <= 1'b0;
+                if (forwarding_valid) begin
+                    lsq[exe_lsq_tag].data <= forwarded_data;
+                    lsq[exe_lsq_tag].data_valid <= 1'b1;
                 end
-                lq_tail <= lq_tail + 1;
-            end 
+            end
+            if (exe_store_valid) begin
+                lsq[exe_lsq_tag].address <= exe_addr;
+                lsq[exe_lsq_tag].data <= exe_data;
+                lsq[exe_lsq_tag].addr_valid <= 1'b1;
+                lsq[exe_lsq_tag].data_valid <= 1'b1;
+            end
             
             // Mark Sent to Memory
             if (issue_load_valid) begin
-                load_queue[issue_load_idx].sent_to_mem <= 1'b1;
-                mem_inflight_load_idx <= issue_load_idx;
+                lsq[issue_load_idx].sent_to_mem <= 1'b1;
+                mem_inflight_idx <= issue_load_idx;
                 mem_inflight_valid <= 1'b1;
             end
             
             // Memory Response
             if (dmem_read_valid && mem_inflight_valid) begin
-                load_queue[mem_inflight_load_idx].complete <= 1'b1;
+                lsq[mem_inflight_idx].data <= dmem_read_data;
+                lsq[mem_inflight_idx].data_valid <= 1'b1;
                 mem_inflight_valid <= 1'b0; // Request done
             end
             
-            // Retirement (Remove completed loads at head)
-            if (load_queue[lq_head].valid && load_queue[lq_head].complete) begin
-                load_queue[lq_head].valid <= 1'b0;
-                lq_head <= lq_head + 1;
+            // 3. Commit Pointer Advance (from ROB)
+            if (commit_lsq && lsq[commit_ptr].valid) begin
+                lsq[commit_ptr].committed <= 1'b1;
+                commit_ptr <= commit_ptr + 1;
             end
             
-            // --- STORE QUEUE ---
-            
-            // Allocate store queue entry
-            if (store_valid && !lsq_sq_full) begin
-                store_queue[sq_tail].address <= store_addr;
-                store_queue[sq_tail].data <= store_data;
-                store_queue[sq_tail].valid <= 1'b1;
-                store_queue[sq_tail].complete <= 1'b1; // Executed, waiting for commit
-                store_queue[sq_tail].committed <= 1'b0;
-                sq_tail <= sq_tail + 1;
-            end
-            
-            // Commit Signal (from ROB)
-            if (commit_store && store_queue[sq_head].valid) begin
-                store_queue[sq_head].committed <= 1'b1;
-            end
-            
-            // Write Completion (Retirement)
-            // If we are writing this cycle, assume it completes and retire from SQ
-            if (store_queue[sq_head].valid && store_queue[sq_head].committed) begin
-                store_queue[sq_head].valid <= 1'b0;
-                sq_head <= sq_head + 1;
+            // 4. Memory Write & Queue Retirement (Popping Head)
+            if (head != commit_ptr) begin // Head has been committed by ROB
+                if (!lsq[head].is_store) begin
+                    // Loads retire immediately after commit
+                    lsq[head].valid <= 1'b0;
+                    head <= head + 1;
+                end else if (lsq[head].committed) begin
+                    // Stores retire when sent to memory
+                    // Assuming 1 cycle write acceptance for dmem_write_en
+                    lsq[head].valid <= 1'b0;
+                    head <= head + 1;
+                end
             end
         end
     end
     
+    // Drive Memory Write Port (Combinational based on Head)
+    assign dmem_write_en = (head != commit_ptr) && lsq[head].is_store && lsq[head].committed;
+    assign dmem_write_addr = lsq[head].address;
+    assign dmem_write_data = lsq[head].data;
+
     // ========================================================================
-    // Output Load Data Selection (Forwarding vs Memory)
-    // =======================================================================
+    // Output Data Selection (Forwarding vs Memory to CDB)
+    // ========================================================================
     always @(*) begin
         load_data = 0;
         load_data_valid = 1'b0;
-        load_tag_out = 0;
+        cdb_phys_tag_out = 0;
         
-        // Priority 1: Instant forwarding for NEW load
-        if (load_valid && forwarding_valid) begin
+        // Priority 1: Instant forwarding for EXECUTING load
+        if (exe_load_valid && forwarding_valid) begin
             load_data = forwarded_data;
             load_data_valid = 1'b1;
-            load_tag_out = load_tag;
+            cdb_phys_tag_out = lsq[exe_lsq_tag].phys_tag;
         end 
         // Priority 2: Memory Response (for Pending Load)
         else if (dmem_read_valid && mem_inflight_valid) begin
-            load_data = dmem_read_data;
+            load_data = lsq[mem_inflight_idx].data; // Data just captured
             load_data_valid = 1'b1;
-            load_tag_out = load_queue[mem_inflight_load_idx].tag;
+            cdb_phys_tag_out = lsq[mem_inflight_idx].phys_tag;
         end
     end
-    
-
-    // ========================================================================
-    // Status Signals
-    // ========================================================================
-    assign lsq_lq_full = (lq_tail + 1 == lq_head);
-    assign lsq_sq_full = (sq_tail + 1 == sq_head);
-    
-    assign load_blocked = 1'b0; // No blocking for RAW, we forward or issue
-    assign store_blocked = 1'b0;
 
 endmodule

@@ -25,6 +25,7 @@ module reservation_station #(
     input [3:0] alu_op,
     input dispatch_valid,
     input [RS_TAG_WIDTH-1:0] dest_tag_in, // Tag assigned to the instruction; used for CDB broadcast
+    input [LSQ_TAG_WIDTH-1:0] lsq_tag_in, // Tag for LSQ entry (if load/store)
     
     // CDB broadcast interface
     input [XLEN-1:0] cdb_result,
@@ -35,6 +36,7 @@ module reservation_station #(
     output [XLEN-1:0] operand1,
     output [XLEN-1:0] operand2,
     output [3:0] execute_op,
+    output [LSQ_TAG_WIDTH-1:0] execute_lsq_tag,
     output execute_valid,
     
     // Status
@@ -55,6 +57,7 @@ module reservation_station #(
         logic src2_ready;
         logic [RS_TAG_WIDTH-1:0] dest_tag;
         logic [3:0] alu_op_val;
+        logic [LSQ_TAG_WIDTH-1:0] lsq_tag;
         logic busy;
     } rs_entry_t;
     
@@ -102,6 +105,7 @@ module reservation_station #(
                 rs_entries[i].src2_ready <= 1'b0;
                 rs_entries[i].dest_tag <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[i].alu_op_val <= 4'b0;
+                rs_entries[i].lsq_tag <= {LSQ_TAG_WIDTH{1'b0}};
             end
             cdb_res_buf <= {XLEN{1'b0}};
             cdb_tag_buf <= {RS_TAG_WIDTH{1'b0}};
@@ -139,6 +143,7 @@ module reservation_station #(
                 rs_entries[alloc_idx].alu_op_val <= alu_op;
                 rs_entries[alloc_idx].dest_tag <= dest_tag_in;
                 rs_entries[alloc_idx].busy <= 1'b1;
+                rs_entries[alloc_idx].lsq_tag <= lsq_tag_in;
 
                 // Handle Src1
                 if (src1_valid) begin
@@ -197,6 +202,7 @@ module reservation_station #(
     assign operand1 = rs_entries[issue_idx].src1_val;
     assign operand2 = rs_entries[issue_idx].src2_val;
     assign execute_op = rs_entries[issue_idx].alu_op_val;
+    assign execute_lsq_tag = rs_entries[issue_idx].lsq_tag;
     
     // ========================================================================
     // Status Signals

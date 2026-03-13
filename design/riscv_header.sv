@@ -118,8 +118,8 @@ parameter VEC_RS_SIZE = 8;             // Vector RS entries
 parameter ROB_SIZE = 16;               // Instruction window size
 
 // Load-Store Queue
-parameter LSQ_LQ_SIZE = 8;             // Load queue depth
-parameter LSQ_SQ_SIZE = 8;             // Store queue depth
+parameter LSQ_SIZE = 16;               // Unified Load/Store queue depth
+parameter LSQ_TAG_WIDTH = 4;           // log2(16)
 
 // ============================================================================
 // FUNCTIONAL UNIT LATENCIES (PIPELINED)

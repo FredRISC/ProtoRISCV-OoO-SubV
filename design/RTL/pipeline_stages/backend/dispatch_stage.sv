@@ -16,7 +16,8 @@ module dispatch_stage #(
     parameter MEM_RS_SIZE = 8,
     parameter MUL_RS_SIZE = 4,
     parameter DIV_RS_SIZE = 4,
-    parameter VEC_RS_SIZE = 8
+    parameter VEC_RS_SIZE = 8,
+    parameter LSQ_TAG_WIDTH = 3
 ) (
     input clk,
     input rst_n,
@@ -57,6 +58,12 @@ module dispatch_stage #(
     // LSQ allocation (for loads/stores)
     output lsq_alloc_valid, // Valid signal for LSQ allocation
 
+    // LSQ Alloc Interface (New)
+    input [LSQ_TAG_WIDTH-1:0] lsq_alloc_tag_in, // Tag from LSQ
+    output [LSQ_TAG_WIDTH-1:0] dispatch_lsq_tag, // Tag to RS
+    output lsq_alloc_req,
+    output lsq_alloc_is_store,
+
     output valid_out
 );
 
@@ -94,8 +101,10 @@ module dispatch_stage #(
     logic use_rs1;
     always @(*) begin
         case (instr_type)
-            `IBASE_LUI, `IBASE_AUIPC, `IBASE_JAL: use_rs1 = 1'b0;
-            default: use_rs1 = 1'b1;
+            `IBASE_LUI, `IBASE_AUIPC, `IBASE_JAL, `V_EXT_VEC, `V_EXT_LOAD, `V_EXT_STORE: 
+                use_rs1 = 1'b0;
+            default: 
+                use_rs1 = 1'b1;
         endcase
     end
     
@@ -105,9 +114,8 @@ module dispatch_stage #(
     
     // Preparing destination register for RAT renaming
     // Avoid unecessary register renaming; stores (S-type) and Branches (B-type) do not write to rd
-    assign dst_arch_internal = (instr_type == `IBASE_STORE || instr_type == `IBASE_BRANCH || instr_type == `V_EXT_STORE) 
-                      ? 5'b0 
-                      : rd;
+    logic use_rd = (instr_type == `IBASE_STORE || instr_type == `IBASE_BRANCH || instr_type == `V_EXT_STORE || instr_type == `V_EXT_VEC || instr_type == `V_EXT_LOAD || instr_type == `IBASE_UNKNOWN);
+    assign dst_arch_internal =  use_rd ? 5'b0 : rd;
 
     // Internal RAT Instantiation
     rat #(.NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS))
@@ -232,8 +240,14 @@ module dispatch_stage #(
     // Control signals
     assign rs_alloc_valid = valid_in && !stall && !flush;
     assign rob_alloc_valid = valid_in && !stall && !flush;
-    assign lsq_alloc_valid = (instr_type == `IBASE_LOAD || instr_type == `IBASE_STORE) 
-                            && valid_in && !stall && !flush;
+    
+    logic is_load = (instr_type == `IBASE_LOAD);
+    logic is_store = (instr_type == `IBASE_STORE);
+    
+    assign lsq_alloc_valid = (is_load || is_store) && valid_in && !stall && !flush;
+    assign lsq_alloc_req = lsq_alloc_valid;
+    assign lsq_alloc_is_store = is_store;
+    assign dispatch_lsq_tag = lsq_alloc_tag_in;
     
     assign valid_out = valid_in && !stall && !flush;
 

@@ -47,6 +47,8 @@ module riscv_core_top (
     logic [3:0] dispatch_rs_type;
     logic dispatch_rs_alloc, dispatch_rob_alloc, dispatch_lsq_alloc;
     logic dispatch_src1_valid, dispatch_src2_valid;
+    logic dispatch_lsq_is_store;
+    logic [LSQ_TAG_WIDTH-1:0] dispatch_lsq_tag, lsq_alloc_tag_from_exec;
     
     // Dispatch outputs
     logic [XLEN-1:0] dispatch_src1, dispatch_src2;
@@ -67,6 +69,7 @@ module riscv_core_top (
     logic [3:0] alu_operation, mem_operation, vec_operation;
     logic alu_valid, mem_valid, mul_valid, div_valid, vec_valid;
     logic [5:0] alu_tag, mem_tag, mul_tag, div_tag, vec_tag;  // Physical reg tags!
+    logic [LSQ_TAG_WIDTH-1:0] mem_lsq_tag; // To Execute
     
     // CDB (Common Data Bus)
     logic [XLEN-1:0] cdb_result;
@@ -83,6 +86,7 @@ module riscv_core_top (
     logic [5:0] rob_commit_dest_phys_reg;  // Physical reg holding the result
     logic [5:0] rob_commit_old_phys_reg;   // Old physical reg to free
     logic [3:0] rob_commit_instr_type;
+    logic rob_commit_is_mem;
     
     // Commit signals
     logic [4:0] reg_write_addr;
@@ -93,7 +97,7 @@ module riscv_core_top (
     logic flush_pipeline, branch_mispredict;
     logic stall_fetch, stall_decode, stall_dispatch;
     logic [XLEN-1:0] branch_target;
-    logic lsq_lq_full, lsq_sq_full;
+    logic lsq_full;
 
     // ========================================================================
     // STAGE 1: FETCH
@@ -158,7 +162,7 @@ module riscv_core_top (
     // STAGE 3: DISPATCH
     // ========================================================================
     
-    dispatch_stage #(.XLEN(XLEN), .INST_WIDTH(INST_WIDTH), .NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS))
+    dispatch_stage #(.XLEN(XLEN), .INST_WIDTH(INST_WIDTH), .NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS), .LSQ_TAG_WIDTH(LSQ_TAG_WIDTH))
     dispatch_inst (.clk(clk), .rst_n(rst_n), .stall(stall_dispatch), .flush(flush_pipeline),
         .instr_in(decode_instr), .instr_type(decode_instr_type), .pc_in(decode_pc), .valid_in(decode_valid),
         .free_phys_reg(free_phys_reg),
@@ -171,7 +175,9 @@ module riscv_core_top (
         .alu_op(dispatch_alu_op), .valid_out(dispatch_valid),
         .src1_valid(dispatch_src1_valid), .src2_valid(dispatch_src2_valid),
         .rs_type(dispatch_rs_type), .rs_alloc_valid(dispatch_rs_alloc),
-        .rob_alloc_valid(dispatch_rob_alloc), .lsq_alloc_valid(dispatch_lsq_alloc)
+        .rob_alloc_valid(dispatch_rob_alloc), .lsq_alloc_valid(dispatch_lsq_alloc),
+        .lsq_alloc_tag_in(lsq_alloc_tag_from_exec), .dispatch_lsq_tag(dispatch_lsq_tag), 
+        .lsq_alloc_req(), .lsq_alloc_is_store(dispatch_lsq_is_store) // Re-routed via dispatch_lsq_alloc below
     );
 
     // ========================================================================
@@ -191,12 +197,13 @@ module riscv_core_top (
         .execute_valid(alu_valid), .rs_full(alu_rs_full), .assigned_tag(alu_tag));
     
     // MEM RS
-    reservation_station #(.RS_SIZE(MEM_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6))
+    reservation_station #(.RS_SIZE(MEM_RS_SIZE), .XLEN(XLEN), .RS_TAG_WIDTH(6), .LSQ_TAG_WIDTH(LSQ_TAG_WIDTH))
     mem_rs_inst (.clk(clk), .rst_n(rst_n), .flush(flush_pipeline),
         .src1_value(dispatch_src1), .src1_tag(rat_src1_phys), .src1_valid(dispatch_src1_valid),
         .src2_value(dispatch_src2), .src2_tag(rat_src2_phys), .src2_valid(dispatch_src2_valid),
         .alu_op(dispatch_alu_op),
         .dest_tag_in(rat_dst_phys),
+        .lsq_tag_in(dispatch_lsq_tag), .execute_lsq_tag(mem_lsq_tag),
         .dispatch_valid(dispatch_rs_alloc && (dispatch_rs_type == `RS_TYPE_MEM)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid),
         .operand1(mem_op1), .operand2(mem_op2), .execute_op(mem_operation),
@@ -260,12 +267,17 @@ module riscv_core_top (
     // ========================================================================
     
     execute_stage #(.XLEN(XLEN), .VLEN(VLEN), .NUM_ALU_FUS(1), .NUM_MUL_FUS(1), .NUM_DIV_FUS(1),
-        .MUL_LATENCY(MUL_LATENCY), .DIV_LATENCY(DIV_LATENCY))
+        .MUL_LATENCY(MUL_LATENCY), .DIV_LATENCY(DIV_LATENCY), .LSQ_TAG_WIDTH(LSQ_TAG_WIDTH))
     execute_inst (.clk(clk), .rst_n(rst_n),
+        .flush(flush_pipeline),
+        // LSQ Allocation Tunneling
+        .lsq_alloc_req(dispatch_lsq_alloc), .lsq_alloc_is_store(dispatch_lsq_is_store),
+        .alloc_phys_tag(rat_dst_phys), .alloc_tag(lsq_alloc_tag_from_exec),
+        .lsq_full(lsq_full),
         .alu_op1(alu_op1), .alu_op2(alu_op2), .alu_operation(alu_operation),
         .alu_valid(alu_valid), .alu_tag(alu_tag),
         .mem_op1(mem_op1), .mem_op2(mem_op2), .mem_operation(mem_operation),
-        .mem_valid(mem_valid), .mem_tag(mem_tag),
+        .mem_valid(mem_valid), .mem_tag(mem_tag), .mem_lsq_tag(mem_lsq_tag),
         .mul_op1(mul_op1), .mul_op2(mul_op2), .mul_valid(mul_valid), .mul_tag(mul_tag),
         .div_op1(div_op1), .div_op2(div_op2), .div_valid(div_valid), .div_tag(div_tag),
         .vec_op1(vec_op1), .vec_op2(vec_op2), .vec_operation(vec_operation),
@@ -274,7 +286,7 @@ module riscv_core_top (
         .dmem_read_data(dmem_read_data), .dmem_read_valid(dmem_read_valid),
         .dmem_write_addr(dmem_write_addr), .dmem_write_data(dmem_write_data), 
         .dmem_write_en(dmem_write_en), .dmem_be(dmem_be),
-        .commit_store(rob_commit_valid && rob_commit_instr_type == `IBASE_STORE),
+        .commit_lsq(rob_commit_valid && (rob_commit_instr_type == `IBASE_STORE || rob_commit_instr_type == `IBASE_LOAD)),
         .cdb_result(cdb_result), .cdb_tag(cdb_tag), .cdb_valid(cdb_valid));
 
     // ========================================================================
@@ -300,13 +312,13 @@ module riscv_core_top (
     
     hazard_detection hazard_inst (.clk(clk), .rst_n(rst_n),
         .rs_full(alu_rs_full || mem_rs_full || mul_rs_full || div_rs_full || vec_rs_full),
-        .rob_full(rob_full), .lsq_full(lsq_lq_full || lsq_sq_full),
+        .rob_full(rob_full), .lsq_full(lsq_full),
         .load_blocked(1'b0), .store_blocked(1'b0),
         .stall_fetch(stall_fetch), .stall_decode(stall_decode), .stall_dispatch(stall_dispatch));
     
     main_controller controller_inst (.clk(clk), .rst_n(rst_n),
         .rs_full(alu_rs_full || mem_rs_full || mul_rs_full || div_rs_full || vec_rs_full),
-        .rob_full(rob_full), .lsq_full(lsq_lq_full || lsq_sq_full),
+        .rob_full(rob_full), .lsq_full(lsq_full),
         .branch_mispredict(branch_mispredict),
         .stall_fetch(stall_fetch), .stall_decode(stall_decode), .stall_dispatch(stall_dispatch),
         .flush_pipeline(flush_pipeline), .pipeline_mode());
@@ -319,10 +331,6 @@ module riscv_core_top (
     exception_handler exc_handler (.clk(clk), .rst_n(rst_n), .ext_irq(ext_irq),
         .illegal_instr(1'b0), .instr_misalign(1'b0), .load_misalign(1'b0), .store_misalign(1'b0),
         .flush_pipeline(), .exception_code(exception_code), .exception_valid(exception_valid));
-    
-    // LSQ stubs
-    assign lsq_lq_full = 1'b0;
-    assign lsq_sq_full = 1'b0;
     
     // Vector operand extension (since RS is 32-bit but VEU is 128-bit)
     assign vec_op1[VLEN-1:XLEN] = '0;

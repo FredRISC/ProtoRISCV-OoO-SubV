@@ -17,10 +17,12 @@ module execute_stage #(
     parameter NUM_MUL_FUS = 1,        // Number of multiplier instances
     parameter NUM_DIV_FUS = 1,        // Number of divider instances
     parameter MUL_LATENCY = 4,
-    parameter DIV_LATENCY = 6
+    parameter DIV_LATENCY = 6,
+    parameter LSQ_TAG_WIDTH = 3
 ) (
     input clk,
     input rst_n,
+    input flush,
     
     // From reservation stations (ALU, MEM, MUL, DIV, VEC)
     input [XLEN-1:0] alu_op1, alu_op2,
@@ -32,6 +34,7 @@ module execute_stage #(
     input [3:0] mem_operation,
     input mem_valid,
     input [3:0] mem_tag,
+    input [LSQ_TAG_WIDTH-1:0] mem_lsq_tag, // LSQ Entry Tag
     
     input [XLEN-1:0] mul_op1, mul_op2,
     input mul_valid,
@@ -45,6 +48,13 @@ module execute_stage #(
     input [3:0] vec_operation,
     input vec_valid,
     input [3:0] vec_tag,
+    
+    // LSQ Tunneling (Dispatch <-> LSQ)
+    input lsq_alloc_req,
+    input lsq_alloc_is_store,
+    input [5:0] alloc_phys_tag,
+    output [LSQ_TAG_WIDTH-1:0] alloc_tag,
+    output lsq_full,
     
     // Memory interface (from LSU)
     // Read Port
@@ -60,7 +70,7 @@ module execute_stage #(
     output [3:0] dmem_be,
     
     // Commit Signal for Store
-    input commit_store,
+    input commit_lsq,
     
     // Common Data Bus Output (ONE result per cycle via CDB arbitration)
     output [XLEN-1:0] cdb_result,
@@ -189,35 +199,37 @@ module execute_stage #(
     // Decode Load/Store (Assuming bit 0 differentiates if ALU_ADD is ambiguous, 
     // or relying on valid bits from Dispatch if implemented. 
     // Here we use a placeholder check; in real design Dispatch should send distinct ops)
-    logic is_store, is_load;
-    assign is_store = (mem_operation == 4'b0001); // Example placeholder encoding
-    assign is_load  = (mem_operation == 4'b0000); // Example placeholder encoding
+    logic exe_is_store, exe_is_load;
+    assign exe_is_store = (mem_operation == 4'b0001); // Defined in Dispatch
+    assign exe_is_load  = (mem_operation == 4'b0000);
     
-    // Mask store address to prevent spurious WAR hazards in LSQ
-    logic [XLEN-1:0] lsq_store_addr;
-    assign lsq_store_addr = (mem_valid && is_store) ? agu_addr : {XLEN{1'b0}};
+    logic [5:0] lsu_tag_extended;
 
-    load_store_queue #(.LSQ_LQ_SIZE(8), .LSQ_SQ_SIZE(8), .XLEN(XLEN)) lsq_inst (
+    load_store_queue #(.LSQ_SIZE(16), .XLEN(XLEN)) lsq_inst (
         .clk(clk),
         .rst_n(rst_n),
-        .flush(1'b0), // Flush not connected in this context, needs top-level signal
+        .flush(flush), 
         
-        // Load interface
-        .load_addr(agu_addr),
-        .load_tag(mem_tag),
-        .load_valid(mem_valid && is_load),
+        // Dispatch Allocation Interface (handled in Top/Dispatch, wired separately)
+        .alloc_req(lsq_alloc_req), 
+        .alloc_is_store(lsq_alloc_is_store),
+        .dispatch_phys_tag(alloc_phys_tag),
+        .alloc_tag(alloc_tag),
+        .lsq_full(lsq_full),
+
+        // Execute Interface
+        .exe_addr(agu_addr),
+        .exe_data(mem_op2),
+        .exe_lsq_tag(mem_lsq_tag),
+        .exe_load_valid(mem_valid && exe_is_load),
+        .exe_store_valid(mem_valid && exe_is_store),
+        
+        // Result Interface
+        .cdb_phys_tag_out(lsu_tag_extended), 
         .load_data(lsu_result),
-        .load_tag_out(lsu_tag),
         .load_data_valid(lsu_valid),
-        .load_blocked(), // Connected to hazard detection via top
         
-        // Store interface
-        .store_addr(lsq_store_addr), // Zeroed if not storing
-        .store_data(mem_op2),        // Store data usually in op2 or needs separate path? 
-                                     // Assuming RS put store data in op2 for STORE ops
-        .store_valid(mem_valid && is_store),
-        .commit_store(commit_store), // Retire store
-        .store_blocked(),            // Connected to hazard detection via top
+        .commit_lsq(commit_lsq), // Retire load/store
         
         // Memory interface
         .dmem_read_addr(dmem_read_addr),
@@ -232,10 +244,11 @@ module execute_stage #(
         .flush_pipeline(), // Not connected yet
         
         // Status
-        .lsq_lq_full(),
-        .lsq_sq_full()
+        .load_blocked(),
+        .store_blocked()
     );
     
+    assign lsu_tag = lsu_tag_extended[3:0]; // Cast to 4 bits for internal signals, but CDB uses extended
     assign dmem_be = 4'b1111; // Default to full word for now
 
     // ========================================================================
@@ -311,7 +324,7 @@ module execute_stage #(
         else if (lsu_valid) begin
             cdb_valid = 1'b1;
             cdb_result = lsu_result;
-            cdb_tag = {4'b0, lsu_tag};
+            cdb_tag = {2'b00, lsu_tag_extended}; // Use full 6-bit tag from LSQ
         end
         // Priority 3: MUL
         else begin
