@@ -17,24 +17,29 @@ module reservation_station #(
     input flush,
     
     // Dispatch interface
-    input [XLEN-1:0] src1_value,
     input [RS_TAG_WIDTH-1:0] src1_tag, // tag from RAT
     input src1_valid,
-    input [XLEN-1:0] src2_value,
     input [RS_TAG_WIDTH-1:0] src2_tag,
     input src2_valid,
+    input use_rs1_in,
+    input use_rs2_in,
+    input use_pc_in,
+    input [RS_TAG_WIDTH-1:0] vl_tag_in,
+    input vl_valid_in,
+    input use_vl_in,
+    input [XLEN-1:0] imm_data, // Constant payload
+    input [XLEN-1:0] vtype_data, // For vector instructions
+    input [XLEN-1:0] pc_data,  // Constant payload
     input [3:0] alu_op,
     input dispatch_valid,
     input [RS_TAG_WIDTH-1:0] dest_tag_in, // Tag assigned to the instruction; used for CDB broadcast
     input [LSQ_TAG_WIDTH-1:0] lsq_tag_in, // Tag for LSQ entry (if load/store)
     
-    // CDB 0 Broadcast Interface (Scheduled - ALU/MUL...)
-    input [XLEN-1:0] cdb0_result,
+    // CDB 0 Broadcast Interface (Tags Only!)
     input [RS_TAG_WIDTH-1:0] cdb0_tag,
     input cdb0_valid,
     
-    // CDB 1 Broadcast Interface (Unscheduled - LSQ/DIV)
-    input [XLEN-1:0] cdb1_result,
+    // CDB 1 Broadcast Interface (Tags Only!)
     input [RS_TAG_WIDTH-1:0] cdb1_tag,
     input cdb1_valid,
     
@@ -42,9 +47,17 @@ module reservation_station #(
     output logic issue_req,
     input logic issue_grant,
     
-    // Execute interface
-    output [XLEN-1:0] operand1,
-    output [XLEN-1:0] operand2,
+    // RegRead interface (Outputs tags & constants, NOT data)
+    output [RS_TAG_WIDTH-1:0] issue_src1_tag,
+    output [RS_TAG_WIDTH-1:0] issue_src2_tag,
+    output logic issue_use_rs1,
+    output logic issue_use_rs2,
+    output logic issue_use_pc,
+    output logic issue_use_vl,
+    output [RS_TAG_WIDTH-1:0] issue_vl_tag,
+    output [XLEN-1:0] issue_imm,
+    output [XLEN-1:0] issue_vtype,
+    output [XLEN-1:0] issue_pc,
     output [3:0] execute_op,
     output [LSQ_TAG_WIDTH-1:0] execute_lsq_tag,
     output execute_valid,
@@ -59,15 +72,22 @@ module reservation_station #(
     // ========================================================================
     
     typedef struct packed {
-        logic [XLEN-1:0] src1_val;
-        logic [XLEN-1:0] src2_val;
         logic [RS_TAG_WIDTH-1:0] src1_tag_val;
         logic [RS_TAG_WIDTH-1:0] src2_tag_val;
         logic src1_ready;
         logic src2_ready;
+        logic [RS_TAG_WIDTH-1:0] vl_tag_val;
+        logic vl_ready;
+        logic use_vl;
         logic [RS_TAG_WIDTH-1:0] dest_tag;
         logic [3:0] alu_op_val;
         logic [LSQ_TAG_WIDTH-1:0] lsq_tag;
+        logic [XLEN-1:0] imm_data;
+        logic [XLEN-1:0] vtype_data;
+        logic [XLEN-1:0] pc_data;
+        logic use_rs1;
+        logic use_rs2;
+        logic use_pc;
         logic busy;
     } rs_entry_t;
     
@@ -79,12 +99,10 @@ module reservation_station #(
     logic allocatable;
     logic [$clog2(RS_SIZE)-1:0] issue_idx;
     
-    // CDB Buffer to avoid race conditions and missing broadcasts
-    reg [XLEN-1:0] cdb0_res_buf;
+    // CDB Tag Buffers
     reg [RS_TAG_WIDTH-1:0] cdb0_tag_buf;
     reg cdb0_val_buf;
     
-    reg [XLEN-1:0] cdb1_res_buf;
     reg [RS_TAG_WIDTH-1:0] cdb1_tag_buf;
     reg cdb1_val_buf;
 
@@ -111,8 +129,6 @@ module reservation_station #(
         if (!rst_n || flush) begin
             for (int i = 0; i < RS_SIZE; i++) begin
                 rs_entries[i].busy <= 1'b0;
-                rs_entries[i].src1_val <= {XLEN{1'b0}};
-                rs_entries[i].src2_val <= {XLEN{1'b0}};
                 rs_entries[i].src1_tag_val <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[i].src2_tag_val <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[i].src1_ready <= 1'b0;
@@ -120,20 +136,25 @@ module reservation_station #(
                 rs_entries[i].dest_tag <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[i].alu_op_val <= 4'b0;
                 rs_entries[i].lsq_tag <= {LSQ_TAG_WIDTH{1'b0}};
+                rs_entries[i].imm_data <= {XLEN{1'b0}};
+                rs_entries[i].vtype_data <= {XLEN{1'b0}};
+                rs_entries[i].pc_data <= {XLEN{1'b0}};
+                rs_entries[i].use_rs1 <= 1'b0;
+                rs_entries[i].use_rs2 <= 1'b0;
+                rs_entries[i].use_pc <= 1'b0;
+                rs_entries[i].use_vl <= 1'b0;
+                rs_entries[i].vl_tag_val <= {RS_TAG_WIDTH{1'b0}};
+                rs_entries[i].vl_ready <= 1'b0;
             end
-            cdb0_res_buf <= {XLEN{1'b0}};
             cdb0_tag_buf <= {RS_TAG_WIDTH{1'b0}};
             cdb0_val_buf <= 1'b0;
-            cdb1_res_buf <= {XLEN{1'b0}};
             cdb1_tag_buf <= {RS_TAG_WIDTH{1'b0}};
             cdb1_val_buf <= 1'b0;
         end 
         else begin
-            // 1. Buffer CDB result (capture transient signal) 
-            cdb0_res_buf <= cdb0_result; // Cycle N+1
+            // 1. Buffer CDB tag (capture transient signal) 
             cdb0_tag_buf <= cdb0_tag;
             cdb0_val_buf <= cdb0_valid;
-            cdb1_res_buf <= cdb1_result;
             cdb1_tag_buf <= cdb1_tag;
             cdb1_val_buf <= cdb1_valid;
 
@@ -144,46 +165,46 @@ module reservation_station #(
                 rs_entries[alloc_idx].dest_tag <= dest_tag_in;
                 rs_entries[alloc_idx].busy <= 1'b1;
                 rs_entries[alloc_idx].lsq_tag <= lsq_tag_in;
+                rs_entries[alloc_idx].imm_data <= imm_data;
+                rs_entries[alloc_idx].vtype_data <= vtype_data;
+                rs_entries[alloc_idx].pc_data <= pc_data;
+                rs_entries[alloc_idx].use_rs1 <= use_rs1_in;
+                rs_entries[alloc_idx].use_rs2 <= use_rs2_in;
+                rs_entries[alloc_idx].use_pc <= use_pc_in;
 
                 // Handle Src1
-                if (src1_valid) begin
-                    rs_entries[alloc_idx].src1_val <= src1_value;
-                    rs_entries[alloc_idx].src1_ready <= 1'b1;
-                end else begin
-                    rs_entries[alloc_idx].src1_tag_val <= src1_tag;
-                    rs_entries[alloc_idx].src1_ready <= 1'b0;
-                end
+                rs_entries[alloc_idx].src1_tag_val <= src1_tag;
+                rs_entries[alloc_idx].src1_ready <= src1_valid | !use_rs1_in;
 
                 // Handle Src2
-                if (src2_valid) begin
-                    rs_entries[alloc_idx].src2_val <= src2_value;
-                    rs_entries[alloc_idx].src2_ready <= 1'b1;
-                end else begin
-                    rs_entries[alloc_idx].src2_tag_val <= src2_tag;
-                    rs_entries[alloc_idx].src2_ready <= 1'b0;
-                end
+                rs_entries[alloc_idx].src2_tag_val <= src2_tag;
+                rs_entries[alloc_idx].src2_ready <= src2_valid | !use_rs2_in;
+                
+                // Handle VL
+                rs_entries[alloc_idx].vl_tag_val <= vl_tag_in;
+                rs_entries[alloc_idx].vl_ready <= vl_valid_in | !use_vl_in;
+                rs_entries[alloc_idx].use_vl <= use_vl_in;
             end
 
-            // 3. Update waiting entries using buffered CDB result; 
+            // 3. Update waiting entries using buffered CDB tags
             for (int i = 0; i < RS_SIZE; i++) begin // Cycle N+1
                 if (rs_entries[i].busy) begin
                     // Check CDB 0
                     if (cdb0_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == cdb0_tag_buf) begin
-                        rs_entries[i].src1_val <= cdb0_res_buf;
                         rs_entries[i].src1_ready <= 1'b1;
                     end
                     if (cdb0_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == cdb0_tag_buf) begin
-                        rs_entries[i].src2_val <= cdb0_res_buf;
                         rs_entries[i].src2_ready <= 1'b1;
+                    end
+                    if (cdb0_val_buf && !rs_entries[i].vl_ready && rs_entries[i].vl_tag_val == cdb0_tag_buf) begin
+                        rs_entries[i].vl_ready <= 1'b1;
                     end
                     
                     // Check CDB 1
                     if (cdb1_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == cdb1_tag_buf) begin
-                        rs_entries[i].src1_val <= cdb1_res_buf;
                         rs_entries[i].src1_ready <= 1'b1;
                     end
                     if (cdb1_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == cdb1_tag_buf) begin
-                        rs_entries[i].src2_val <= cdb1_res_buf;
                         rs_entries[i].src2_ready <= 1'b1;
                     end
                 end
@@ -192,8 +213,6 @@ module reservation_station #(
             // 4. Issued - Free issued entry on next cycle
             if (execute_valid) begin
                 rs_entries[issue_idx].busy <= 1'b0;
-                rs_entries[issue_idx].src1_val <= {XLEN{1'b0}};
-                rs_entries[issue_idx].src2_val <= {XLEN{1'b0}};
                 rs_entries[issue_idx].src1_tag_val <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[issue_idx].src2_tag_val <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[issue_idx].src1_ready <= 1'b0;
@@ -201,6 +220,15 @@ module reservation_station #(
                 rs_entries[issue_idx].dest_tag <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[issue_idx].alu_op_val <= 4'b0;
                 rs_entries[issue_idx].lsq_tag <= {LSQ_TAG_WIDTH{1'b0}};
+                rs_entries[issue_idx].imm_data <= {XLEN{1'b0}};
+                rs_entries[issue_idx].vtype_data <= {XLEN{1'b0}};
+                rs_entries[issue_idx].pc_data <= {XLEN{1'b0}};
+                rs_entries[issue_idx].use_rs1 <= 1'b0;
+                rs_entries[issue_idx].use_rs2 <= 1'b0;
+                rs_entries[issue_idx].use_pc <= 1'b0;
+                rs_entries[issue_idx].use_vl <= 1'b0;
+                rs_entries[issue_idx].vl_tag_val <= {RS_TAG_WIDTH{1'b0}};
+                rs_entries[issue_idx].vl_ready <= 1'b0;
             end
         end
     end
@@ -213,7 +241,8 @@ module reservation_station #(
         for (int i = 0; i < RS_SIZE; i++) begin
             entry_ready[i] = rs_entries[i].busy && 
                            rs_entries[i].src1_ready && 
-                           rs_entries[i].src2_ready;
+                           rs_entries[i].src2_ready &&
+                           rs_entries[i].vl_ready; // vl is always ready for scalar instructions.
         end
     end
     
@@ -234,13 +263,22 @@ module reservation_station #(
     
     assign issue_req = (entry_ready != 0);
     assign execute_valid = issue_req && issue_grant;
-    assign operand1 = rs_entries[issue_idx].src1_val;
-    assign operand2 = rs_entries[issue_idx].src2_val;
+    
+    assign issue_src1_tag = rs_entries[issue_idx].src1_tag_val;
+    assign issue_src2_tag = rs_entries[issue_idx].src2_tag_val;
+    assign issue_use_rs1 = rs_entries[issue_idx].use_rs1;
+    assign issue_use_rs2 = rs_entries[issue_idx].use_rs2;
+    assign issue_use_pc  = rs_entries[issue_idx].use_pc;
+    assign issue_use_vl  = rs_entries[issue_idx].use_vl;
+    assign issue_vl_tag  = rs_entries[issue_idx].vl_tag_val;
+    assign issue_imm = rs_entries[issue_idx].imm_data;
+    assign issue_vtype = rs_entries[issue_idx].vtype_data;
+    assign issue_pc = rs_entries[issue_idx].pc_data;
     assign execute_op = rs_entries[issue_idx].alu_op_val;
     assign execute_lsq_tag = rs_entries[issue_idx].lsq_tag;
     
     // ========================================================================
-    // Status Signals
+    // Destination tag for CDB broadcast
     // ========================================================================
     
     assign assigned_tag = rs_entries[issue_idx].dest_tag;

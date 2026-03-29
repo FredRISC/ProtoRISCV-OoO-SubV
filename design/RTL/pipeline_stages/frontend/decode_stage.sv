@@ -68,7 +68,12 @@ module decode_stage #(
                 7'b1100111: instr_type_out <= `IBASE_JALR; //JALR
                 7'b0110111: instr_type_out <= `IBASE_LUI;  //LUI
                 7'b0010111: instr_type_out <= `IBASE_AUIPC;  //AUIPC
-                7'b1010111: instr_type_out <= `V_EXT_VEC; //OP-V
+                7'b1010111: begin // OP-V
+                    if (funct3 == 3'b111) // VSETVLI
+                        instr_type_out <= `V_EXT_CONFIG;
+                    else
+                        instr_type_out <= `V_EXT_VEC;
+                end
                 7'b0000111: instr_type_out <= `V_EXT_LOAD; //LOAD-FP
                 7'b0100111: instr_type_out <= `V_EXT_STORE; //STORE-FP
                 default:    instr_type_out <= `IBASE_UNKNOWN;

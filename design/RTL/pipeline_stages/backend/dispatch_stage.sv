@@ -32,46 +32,55 @@ module dispatch_stage #(
 
     // Essentially the dispatch_stage initialization signal
     output valid_out, // Sent to enable free_list & PRF; asserted when decode_stage output is valid
-    output [4:0] dest_reg, // MUXed Architectural destination register sent to ROB for bookkeeping
+    
     // Free List Interface
-    input [5:0] free_phys_reg, // From free_list to RAT for registering new mapping
+    input [5:0] free_phys_reg, // free_list -> RAT for registering new mapping
+    input [5:0] free_vphys_reg, // vector_free_list -> vRAT
 
-    // RAT -> PRF & RS Interface (dispatch)
-    output [5:0] phys_rs1, phys_rs2, // Look up mapping by RAT (= spec_rat[src1_arch]); to PRF for operand value and valid bit and to RS for tagging
-    // RAT -> RS & ROB Interface (dispatch)
-    output [5:0] phys_rd, // To RS/ROB for tagging (phys_rd = free_phys_reg)
-    output phys_rd_old, // Old mapping of the rd register to be freed; sent to ROB on allocation
+    // Physical Register File Interface (Dispatch's RAT -> PRF & RS Interface)
+    output [5:0] phys_rs1, phys_rs2, // Look up mapping by RAT (= spec_rat[src1_arch])
 
-    // Physical Register File Interface (for operand values and valid bits)
-    input [XLEN-1:0] PReg_src1_value, PReg_src2_value, // Physical register values 
+    
+    // ROB Interface (Dispatch -> ROB Interface)
+    output rob_alloc_valid, // Request for ROB allocation 
+    output [5:0] phys_rd, // To RS/ROB for CDB tag matching (= free_phys_reg)
+    output [4:0] dest_reg, // MUXed Architectural destination register; sent to ROB for commit_stage
+    output phys_rd_old, // Old RAT mapping of the rd register to be freed; sent to ROB on allocation
+
+    // Physical Register File Interface (Operands Ready?)
     input PReg_src1_valid_in, PReg_src2_valid_in,      // Physical register valid bits
     
-    // MUXed source operand values to reservation station
-    output [XLEN-1:0] src1_value, // operand 1 value (register)
-    output [XLEN-1:0] src2_value, // operand 2 value (register or immediate)
-    output src1_valid, // Operand 1 is ready (immediate/PC or valid reg)
-    output src2_valid, // Operand 2 is ready (immediate or valid reg)
+    // Reservation Station Interface
+    output rs_alloc_valid, // Requst for RS allocation
+    output [3:0] rs_type,  // Which RS to use (ALU, MEM, MUL, DIV, VEC)
+    output [3:0] alu_op, // Encoded Control signals for ALU
+    output [XLEN-1:0] imm_out,
+    output [XLEN-1:0] pc_out,
+    output use_rs1_out,
+    output use_rs2_out,
+    output use_pc_out,
+    output use_vl_out,
+    
+    // Vector CSR Interface
+    input [31:0] spec_vtype, // Only read from CSR
+    output logic [31:0] vtype_out, // Passed down to issue stage
+    output logic vtype_update_en, // The update en to vtype CSR module
+    output logic [31:0] new_vtype,
 
-    // Control signals for execution
-    output [3:0] alu_op,
 
-    // RS allocation
-    output [3:0] rs_type,  // Which RS to use
-    output rs_alloc_valid, // Valid signal for RS allocation   
-    // ROB allocation
-    output rob_alloc_valid, // Valid signal for ROB allocation
-
-    // LSQ Alloc Interface (New)
+    // LSQ Alloc Interface 
     input [LSQ_TAG_WIDTH-1:0] lsq_alloc_tag_in, // Tag from LSQ
     output [LSQ_TAG_WIDTH-1:0] dispatch_lsq_tag, // Tag to RS
-    output lsq_alloc_req,
-    output lsq_alloc_is_store,
+    output lsq_alloc_req, // Request for LSQ allocation
+    output lsq_alloc_is_store, // Load or Store?
     output [2:0] lsq_alloc_size, // funct3 to define byte/half/word
 
-    // RPB -> RAT Interface (commit)
-    input [4:0] commit_arch_reg,     // To update architectural RAT
-    input [5:0] commit_phys_reg,     // To update architectural RAT
-    input commit_en                 // To update architectural RAT
+    // Commit Interface (ROB -> RAT Interface)
+    input [4:0] commit_arch_reg,  // To update RAT's or vRAT's architectural state
+    input [5:0] commit_phys_reg,     
+    input commit_rat, // to enable the update of RAT architectural state                
+    input commit_vrat // to enable the update of vRAT architectural state
+
 );
 
     // Extract fields from instruction
@@ -79,6 +88,7 @@ module dispatch_stage #(
     logic [4:0] rs1, rs2, rd; // Architectural register addresses
     logic [3:0] funct3;
     logic [6:0] funct7;
+    logic [10:0] zimm;
     
     assign opcode = instr_in[6:0];
     assign rd = instr_in[11:7];
@@ -86,75 +96,156 @@ module dispatch_stage #(
     assign rs1 = instr_in[19:15];
     assign rs2 = instr_in[24:20];
     assign funct7 = instr_in[31:25];
+    assign zimm = instr_in[30:20];
+    
 
     logic [4:0] rs1_arch_internal, rs2_arch_internal, dst_arch_internal;
     // Sign-extend immediate
     logic [XLEN-1:0] imm_extended;
 
 
+    logic is_vec_arith = (instr_type == `V_EXT_VEC);
+    logic is_vec_load = (instr_type == `V_EXT_LOAD);
+    logic is_vec_store = (instr_type == `V_EXT_STORE);
+    logic is_vec_config = (instr_type == `V_EXT_CONFIG);
+
+    logic is_OPIVI = (funct3 == 3'b011);
+    logic is_OPIVV = (funct3 == 3'b000); 
+
+    // Extract current Vector Configuration locally
+    logic [2:0] current_sew;
+    logic [2:0] current_lmul;
+    always @(*) begin
+        if (instr_type == `V_EXT_CONFIG) begin
+            current_sew = zimm[5:3];
+            current_lmul = zimm[2:0];
+        end else begin
+            current_sew = spec_vtype[5:3]; // Safely read from speculative CSR!
+            current_lmul = spec_vtype[2:0];
+        end
+    end
+
+    // Determine if RS1 is used
+    logic use_rs1;
+    always @(*) begin
+        case (instr_type)
+            `IBASE_LUI, `IBASE_AUIPC, `IBASE_JAL: 
+                use_rs1 = 1'b0; 
+            `V_EXT_CONFIG: // Now only support vsetvli; ignore vsetivli and vsetvl
+                use_rs1 = 1'b1;
+            `V_EXT_VEC: // V_EXT_LOAD/STORE use scalar rs1 for base address!
+                if (is_OPIVV) begin
+                    use_rs1 = 1'b1;
+                end
+                else if(is_OPIVI) begin
+                    use_rs1 = 1'b0;
+                end
+            default: 
+                use_rs1 = 1'b1;
+        endcase
+    end
+
     // Determine if RS2 is used (register dependency)
-    // Used for: R-Type, Branch, Store (Vector is on different path)
+    // Used for: R-Type, Branch, Store
     logic use_rs2;
     always @(*) begin
         case (instr_type)
-            `IBASE_ALU, `IBASE_BRANCH, `IBASE_STORE, `M_EXT_MUL, `M_EXT_DIV:
+            `IBASE_ALU, `IBASE_BRANCH, `IBASE_STORE, `M_EXT_MUL, `M_EXT_DIV, `V_EXT_VEC:
                 use_rs2 = 1'b1;
             default:
                 use_rs2 = 1'b0;
         endcase
     end
-    
-    // Determine if RS1 is used
-    logic use_rs1;
-    always @(*) begin
-        case (instr_type)
-            `IBASE_LUI, `IBASE_AUIPC, `IBASE_JAL, `V_EXT_VEC, `V_EXT_LOAD, `V_EXT_STORE: 
-                use_rs1 = 1'b0;
-            default: 
-                use_rs1 = 1'b1;
-        endcase
-    end
-    
-    // Preparing architectural addresses for RAT mapping
-    assign rs1_arch_internal = (use_rs1) ? rs1 : 5'b0; // Zero out if unused
-    assign rs2_arch_internal = (use_rs2) ? rs2 : 5'b0; // Zero out if unused to prevent false dependency in RAT
+
+    // Preparing architectural addresses for RAT/vRAT mapping
+    assign rs1_arch_internal = use_rs1 ? rs1 : 5'b0; 
+    assign rs2_arch_internal = use_rs2 ? rs2 : 5'b0; 
     
     // Preparing destination register for RAT renaming
-    // Avoid unecessary register renaming; stores (S-type) and Branches (B-type) do not write to rd
-    logic has_no_scalar_rd = (instr_type == `IBASE_STORE || instr_type == `IBASE_BRANCH || instr_type == `V_EXT_STORE || instr_type == `V_EXT_VEC || instr_type == `V_EXT_LOAD || instr_type == `IBASE_UNKNOWN);
-    assign dst_arch_internal =  has_no_scalar_rd ? 5'b0 : rd;
+    // Use dummy dest register for renaming of dest-less instructions
+    logic Use_Dummy_rd = (instr_type == `IBASE_STORE || instr_type == `IBASE_BRANCH || instr_type == `V_EXT_STORE || instr_type == `IBASE_UNKNOWN);
+    assign dst_arch_internal = Use_Dummy_rd ? 5'b0 : rd;
 
-    // Internal RAT Instantiation
+    logic [5:0] scalar_phys_rs1, scalar_phys_rs2, scalar_phys_rd_old;
+    logic [5:0] vec_phys_rs1, vec_phys_rs2, vec_phys_rd_old;
+
+    logic Scalar_Rename_en = !Use_Dummy_rd && (!is_vec_arith && !is_vec_load && !is_vec_store); // V.CONFIG like vsetvli is executed through scalar datapath
     rat #(.NUM_INT_REGS(NUM_INT_REGS), .NUM_PHYS_REGS(NUM_PHYS_REGS))
-    rat_inst (
+    scalar_rat_inst (
         .clk(clk), .rst_n(rst_n), .flush(flush),
         .src1_arch(rs1_arch_internal), .src2_arch(rs2_arch_internal),
-        .src1_phys(phys_rs1), .src2_phys(phys_rs2),
+        .src1_phys(scalar_phys_rs1), .src2_phys(scalar_phys_rs2),
         .dst_arch(dst_arch_internal), .dst_phys(free_phys_reg),
-        .dst_old_phys(phys_rd_old),
-        .rename_en(valid_in && !stall && !flush && (dst_arch_internal != 5'b0)),
-        .commit_arch(commit_arch_reg), .commit_phys(commit_phys_reg), .commit_en(commit_en)
+        .dst_old_phys(scalar_phys_rd_old),
+        .rename_en(valid_in && !stall && !flush && Scalar_Rename_en), 
+        .commit_arch(commit_arch_reg), .commit_phys(commit_phys_reg), .commit_en(commit_rat)
+    );
+    
+    logic Vector_Rename_en = (is_vec_arith || is_vec_load); // DO NOT RENAME V.STORE and V.CONFIG
+    vector_rat vector_rat_inst (
+        .clk(clk), .rst_n(rst_n), .flush(flush),
+        .src1_arch(rs1_arch_internal), .src2_arch(is_vec_store ? rd : rs2_arch_internal), // V.STORE encodes vs3 (store data) in the rd field;
+        .src1_phys(vec_phys_rs1), .src2_phys(vec_phys_rs2), // We use vec_phys_rs2 for V.STORE
+        .dst_arch(rd), .dst_phys(free_vphys_reg),
+        .dst_old_phys(vec_phys_rd_old),
+        .rename_en(valid_in && !stall && !flush &&  Vector_Rename_en), 
+        .commit_arch(commit_arch_reg), .commit_phys(commit_phys_reg), .commit_en(commit_vrat)
     );
 
-    // Assigning physical destination register for RS/ROB tagging
-    assign phys_rd = free_phys_reg;
+    // Multiplex outputs based on execution domain
+    assign phys_rs1 = is_vec_arith ? vec_phys_rs1 : scalar_phys_rs1; // vsetvli, V.LOAD, V.STORE use scalar_phys_rs1
+    assign phys_rs2 = (is_vec_arith || is_vec_store) ? vec_phys_rs2 : scalar_phys_rs2; // V.STORE uses vec_phys_rs2 as store data (vs3) 
+    assign phys_rd =  (is_vec_arith || is_vec_load || is_vec_store) ? free_vphys_reg : free_phys_reg; 
     
-    // Output architectural destination register to ROB
-    assign dest_reg = dst_arch_internal;
+    // Selecting the old physical register to free on commit
+    always @(*) begin
+        if((is_vec_arith || is_vec_load)) begin
+            phys_rd_old = vec_phys_rd_old;
+        end
+        else if(is_vec_store) begin
+            phys_rd_old = free_vphys_reg; // free the dummy physical register
+        end
+        else begin
+            if(Use_Dummy_rd) begin
+                phys_rd_old = free_phys_reg; // free the dummy physical register
+            end
+            else begin
+                phys_rd_old = scalar_phys_rd_old; 
+            end
+        end
+    end
 
-    // MUXed source operands and ready signals to reservation station
-    // Mux for src1: LUI uses 0, AUIPC uses PC, others use PReg value
-    assign src1_value = (instr_type == `IBASE_LUI)   ? {XLEN{1'b0}} :
-                        (instr_type == `IBASE_AUIPC || instr_type == `IBASE_JAL) ? pc_in :
-                        PReg_src1_value;
-    // Mux for src2: Register value OR Immediate
-    assign src2_value = (use_rs2) ? PReg_src2_value : imm_extended;
-    assign src1_valid = (use_rs1) ? PReg_src1_valid_in : 1'b1; // Valid if not using reg (imm/pc) or reg is valid
-    assign src2_valid = (use_rs2) ? PReg_src2_valid_in : 1'b1;
+
+    // Output architectural destination register to ROB
+    assign dest_reg = dst_arch_internal; // Dummied as x0 for dest-less scalar instruction.
+
+    // Tunnel Vector Configuration through unused RS payload fields!
+    assign imm_out = imm_extended; // No more tunneling
+    assign pc_out =  pc_in;
+    assign vtype_out = spec_vtype;
+
+    assign use_rs1_out = use_rs1; // to reg_read_stage
+    assign use_rs2_out = use_rs2;
+    assign use_pc_out = (instr_type == `IBASE_AUIPC || instr_type == `IBASE_JAL || instr_type == `IBASE_JALR || instr_type == `IBASE_BRANCH);
+    assign use_vl_out = (instr_type == `V_EXT_VEC || instr_type == `V_EXT_LOAD || instr_type == `V_EXT_STORE);
+    
+    // VSETVLI Speculative Execution trigger
+    assign vtype_update_en = (instr_type == `V_EXT_CONFIG) && valid_in && !stall && !flush;
+    assign new_vtype = {21'b0, zimm}; // Extract zimm[10:0]
     
     // Immediate generation based on instruction type
     always @(*) begin
         case (instr_type)
+            `IBASE_ALU_IMM:
+                imm_extended = {{20{instr_in[31]}}, instr_in[31:20]}; // Sign-extend for regular immediates
+            `V_EXT_LOAD, `V_EXT_STORE, `V_EXT_CONFIG:
+                imm_extended = 32'b0; // RVV memory ops and vsetvli don't use immediate offsets
+            `V_EXT_VEC: begin
+                if (is_OPIVI) 
+                    imm_extended = {{27{instr_in[19]}}, instr_in[19:15]}; // Sign-extend 5-bit rs1 field for OPIVI
+                else 
+                    imm_extended = 32'b0;
+            end
             `IBASE_STORE:  // S-Type
                 imm_extended = {{20{instr_in[31]}}, instr_in[31:25], instr_in[11:7]};
             `IBASE_BRANCH: // B-Type
@@ -174,9 +265,14 @@ module dispatch_stage #(
             // Vector Operation Decoding (based on funct6)
             // Note: We currently ONLY support Vector-Vector (.VV) OPVV operations. 
             // RISC-V use funct3 to distinguish between .VV, .VX, and .VI
-            // .VV ops use funct3 = 3'b000 (OPIVV - Integer Vector-Vector) or 3'b010 (OPMVV - Mask/Miscellaneous Vector-Vector).
-            // .VX (Scalar) and .VI (Immediate) are filtered out here to prevent mis-execution.
-            if (funct3 == 3'b000 || funct3 == 3'b010) begin
+            // OPIVV uses funct3 = 3'b000 - Integer Vector-Vector; 
+            // OPIVI uses funct3 = 3'b011 - Integer Vector-Immediate
+            // OPIVX uses funct3 = 3'b100 - Integer Vector-Scalar
+            // OPCFG (e.g. vsetli) uses funct3 = 3'b111
+            // OPMVV uses funct = 3'b010 - (Miscellaneous) Mask/Permutation Vector-Vector
+            // OPIVX and OPMVV will be implemented in the future
+
+            if (funct3 == 3'b000 || funct3 == 3'b011) begin // OPIVV or OPIVI
                 case (funct7[6:1]) // funct6 is top 6 bits of funct7
                     6'b000000: alu_op = `VEC_OP_ADD;
                     6'b000010: alu_op = `VEC_OP_SUB;
@@ -221,9 +317,16 @@ module dispatch_stage #(
             // M-Extension Operation Decoding
             // funct3 maps directly to the operation subtype (MUL, MULH, DIV, REM, etc.)
             alu_op = {1'b0, funct3};
+        end else if (instr_type == `V_EXT_CONFIG) begin
+            // VSETVLI requires special ALU handling to compute min(AVL, VLMAX)
+            alu_op = `ALU_VSETVL;
+        end else if (instr_type == `IBASE_STORE || instr_type == `V_EXT_STORE) begin
+            // execute_stage expects 0001 for stores
+            alu_op = 4'b0001;
+        end else if (instr_type == `IBASE_LOAD || instr_type == `V_EXT_LOAD) begin
+            // execute_stage expects 0000 for loads
+            alu_op = 4'b0000;
         end else begin
-            // Default for Loads, Stores, Jumps, LUI, AUIPC (Address Calculation)
-            // Also covers Vector Load/Store which need base address calculation.
             alu_op = `ALU_ADD;
         end
     end
@@ -245,22 +348,25 @@ module dispatch_stage #(
             `V_EXT_VEC:      rs_type = `RS_TYPE_VEC;
             `V_EXT_LOAD:     rs_type = `RS_TYPE_MEM; // Vector Loads go to MEM RS
             `V_EXT_STORE:    rs_type = `RS_TYPE_MEM; // Vector Stores go to MEM RS
+            `V_EXT_CONFIG:   rs_type = `RS_TYPE_ALU; // VSETVLI goes to ALU (writes VL to scalar rd)
             default:         rs_type = `RS_TYPE_NONE;
         endcase
     end
-    
+
+
     // Control signals for RS, ROB, and LSQ allocation
     assign rs_alloc_valid = valid_in && !stall && !flush;
     assign rob_alloc_valid = valid_in && !stall && !flush;
     
-    logic is_load = (instr_type == `IBASE_LOAD);
-    logic is_store = (instr_type == `IBASE_STORE);
+    logic is_load = (instr_type == `IBASE_LOAD || instr_type == `V_EXT_LOAD);
+    logic is_store = (instr_type == `IBASE_STORE || instr_type == `V_EXT_STORE);
     
     assign lsq_alloc_req = (is_load || is_store) && valid_in && !stall && !flush;
     assign lsq_alloc_is_store = is_store;
     assign lsq_alloc_size = funct3; // Record size at allocation!
     assign dispatch_lsq_tag = lsq_alloc_tag_in;
     
+    // All signals should be prepared in one cycle 
     assign valid_out = valid_in && !stall && !flush;
 
 endmodule

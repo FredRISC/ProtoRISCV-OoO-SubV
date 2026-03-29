@@ -13,6 +13,7 @@
 module execute_stage #(
     parameter XLEN = 32,
     parameter VLEN = 128,
+    parameter DLEN = `DLEN,
     parameter NUM_ALU_FUS = 1,        // Number of ALU instances
     parameter NUM_MUL_FUS = 1,        // Number of multiplier instances
     parameter NUM_DIV_FUS = 1,        // Number of divider instances
@@ -25,14 +26,17 @@ module execute_stage #(
     input flush,
     
     // From reservation stations (ALU, MEM, MUL, DIV, VEC)
-    input [XLEN-1:0] alu_op1, alu_op2,
+    input [XLEN-1:0] alu_op1, alu_op2, // Operand 1 (Register or PC or 0), Operand 2 (Register or Imm)
     input [3:0] alu_operation,
     input alu_valid,
     input [5:0] alu_tag,
     
-    input [XLEN-1:0] mem_op1, mem_op2,
+    input [XLEN-1:0] mem_op1, // Base Address
+    input [DLEN-1:0] mem_op2, // Store Data (Scalar or Vector)
+    input [XLEN-1:0] mem_imm,
     input [3:0] mem_operation,
     input mem_valid,
+    input [31:0] mem_vl,
     input [5:0] mem_tag,
     input [LSQ_TAG_WIDTH-1:0] mem_lsq_tag, // LSQ Entry Tag
     
@@ -48,6 +52,8 @@ module execute_stage #(
     input [3:0] vec_operation,
     input vec_valid,
     input [5:0] vec_tag,
+    input [31:0] vec_vl,
+    input [31:0] vec_vtype,
     
     // LSQ Tunneling (Dispatch <-> LSQ)
     input lsq_alloc_req,
@@ -86,7 +92,12 @@ module execute_stage #(
     // CDB 1 Broadcast Interface (Unscheduled - LSQ/DIV)
     output logic [XLEN-1:0] cdb1_result,
     output logic [5:0] cdb1_tag,
-    output logic cdb1_valid
+    output logic cdb1_valid,
+
+    // Vector CDB Broadcast Interface (128-bit)
+    output logic [VLEN-1:0] vec_cdb_result,
+    output logic [5:0] vec_cdb_tag,
+    output logic vec_cdb_valid
 );
 
     // ========================================================================
@@ -204,7 +215,7 @@ module execute_stage #(
     
     // AGU (Address Generation Unit)
     logic [XLEN-1:0] agu_addr;
-    assign agu_addr = mem_op1 + mem_op2;
+    assign agu_addr = mem_op1 + mem_imm;
 
     // Decode Load/Store (Assuming bit 0 differentiates if ALU_ADD is ambiguous, 
     // or relying on valid bits from Dispatch if implemented. 
@@ -230,7 +241,7 @@ module execute_stage #(
 
         // Execute Interface
         .exe_addr(agu_addr),
-        .exe_data(mem_op2),
+        .exe_data(mem_op2[XLEN-1:0]), // TRUNCATED temporarily until VLSU is implemented
         .exe_lsq_tag(mem_lsq_tag),
         .exe_load_valid(mem_valid && exe_is_load),
         .exe_store_valid(mem_valid && exe_is_store),
@@ -274,8 +285,8 @@ module execute_stage #(
     ) veu_inst (
         .clk(clk),
         .rst_n(rst_n),
-        .vl(32'd16),
-        .vtype(32'h0),
+        .vl(vec_vl),
+        .vtype(vec_vtype),
         .vec_src1(vec_op1),
         .vec_src2(vec_op2),
         .vec_op(vec_operation),
@@ -372,10 +383,6 @@ module execute_stage #(
             cdb0_valid = 1'b1;
             cdb0_result = mul_result_selected;
             cdb0_tag = mul_tag_selected;
-        end else if (vec_result_valid) begin
-            cdb0_valid = 1'b1;
-            cdb0_result = vec_result[XLEN-1:0];
-            cdb0_tag = vec_result_tag;
         end
     end
 
@@ -398,6 +405,15 @@ module execute_stage #(
             cdb1_result = div_result_selected;
             cdb1_tag = div_tag_selected;
         end
+    end
+
+    // ========================================================================
+    // Dedicated Vector CDB
+    // ========================================================================
+    always @(*) begin
+        vec_cdb_valid = vec_result_valid;
+        vec_cdb_result = vec_result;
+        vec_cdb_tag = vec_result_tag;
     end
 
 endmodule

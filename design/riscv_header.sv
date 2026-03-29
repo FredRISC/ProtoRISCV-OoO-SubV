@@ -37,6 +37,7 @@ parameter INST_WIDTH = 32;        // Instruction width
 `define ALU_SRA  4'b0111
 `define ALU_OR   4'b1000
 `define ALU_AND  4'b1001
+`define ALU_VSETVL 4'b1010
 `define UNKNOWN_ALU_OP 4'b1111
 
 // Vector Operation Codes (4-bit, shared with ALU_OP bus)
@@ -73,6 +74,7 @@ parameter logic [3:0] `M_EXT_DIV = 4'h8;      // DIV, DIVU, REM, REMU (RV32M)
 parameter logic [3:0] `V_EXT_VEC = 4'h9;      // VADD, VMUL, etc (RVV)
 parameter logic [3:0] `V_EXT_LOAD = 4'hA; // Vector Load
 parameter logic [3:0] `V_EXT_STORE = 4'hB;// Vector Store
+parameter logic [3:0] `V_EXT_CONFIG = 4'hE; // VSETVLI
 parameter logic [3:0] `IBASE_UNKNOWN = 4'hF;  // Unknown instruction
 
 // Exception codes
@@ -133,9 +135,23 @@ parameter DIV_LATENCY = 6;             // Divider: 6-cycle pipeline
 // ============================================================================
 
 parameter VLEN = 128;                  // Vector register width (bits)
-parameter VLMAX = 16;                  // Max vector length (elements for 32-bit)
+parameter MAX_LMUL = 1;                // Maximum LMUL supported
+parameter MAX_VLMAX = VLEN * MAX_LMUL/8;  // Absolute physical max elements (effective VLEN / MIN_SEW)
 parameter ELEN = 32;                   // Element width (bits)
 parameter NUM_VEC_LANES = 4;           // Number of parallel lanes
+parameter DLEN = ELEN * NUM_VEC_LANES; // Data path width for vector operations (bits)
+
+// ----------------------------------------------------------------------------
+// RVV MINIMAL SUBSET TARGET (Zve32x - Stripped Down)
+// ----------------------------------------------------------------------------
+// - Config: vsetvli (Sets VL, assumes ELEN=32, LMUL=1, vstart=0)
+// - Memory: vle32.v (Vector Load), vse32.v (Vector Store)
+// - Arith (OPVV): vadd.vv, vsub.vv, vmul.vv, vand.vv, vor.vv, vxor.vv
+// - Arith (OPVI): vadd.vi, vand.vi, vor.vi, vxor.vi
+// - Shifts (OPVI): vsll.vi, vsrl.vi, vsra.vi
+// - Excluded: Floating-point, mask operations, widening/narrowing, reductions
+// - Dependencies: OPVX requires cross-domain scalar snooping (Future feature)
+// ----------------------------------------------------------------------------
 
 // ============================================================================
 // CDB (COMMON DATA BUS)

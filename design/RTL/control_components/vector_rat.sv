@@ -1,14 +1,12 @@
 // ============================================================================
-// rat.sv (Register Alias Table)
+// vector_rat.sv (Vector Register Alias Table)
 // ============================================================================
-// Maps architectural registers to PHYSICAL registers
-// Key difference from rename_table:
-//   - Maps to physical register IDs, not ROB IDs
-//   - Tracks which phys reg holds which arch reg's value
+// Maps architectural vector registers (v0-v31) to PHYSICAL vector registers
+// (vp0-vp63). Operates completely independently of the scalar RAT.
 
-`include "riscv_header.sv"
+`include "../riscv_header.sv"
 
-module rat (
+module vector_rat (
     input clk,
     input rst_n,
     input flush,
@@ -33,42 +31,35 @@ module rat (
     input commit_en
 );
 
-    // Two tables: 
-    // 1. Speculative RAT (used for dispatch/renaming)
-    // 2. Architectural RAT (used for recovery on flush)
-    logic [5:0] spec_rat [NUM_INT_REGS-1:0];
-    logic [5:0] arch_rat [NUM_INT_REGS-1:0];
+    // Speculative Vector RAT (used for dispatch/renaming)
+    // Architectural Vector RAT (used for recovery on flush)
+    logic [5:0] spec_rat [NUM_VEC_REGS-1:0];
+    logic [5:0] arch_rat [NUM_VEC_REGS-1:0];
     
-    // Read: combinational lookup
     assign src1_phys = spec_rat[src1_arch];
     assign src2_phys = spec_rat[src2_arch];
     assign dst_old_phys = spec_rat[dst_arch]; // Read old mapping before update
     
-    // Sequential updates
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            // Initialize: arch reg i maps to phys reg i (0-31)
-            for (int i = 0; i < NUM_INT_REGS; i++) begin
+            for (int i = 0; i < NUM_VEC_REGS; i++) begin
                 spec_rat[i] <= i[5:0];
                 arch_rat[i] <= i[5:0];
             end
         end else begin
-            // Update Architectural RAT on commit (Always happens, even during flush)
-            if (commit_en && commit_arch != 5'b0) begin
+            if (commit_en) // Register the commit state mapping to architectural vRAT (even on flush)
                 arch_rat[commit_arch] <= commit_phys;
-            end
-            
-            // Roll Back on flush
+                
             if (flush) begin
-                // Recovery: Restore from architectural RAT, including the new commit
-                for (int i = 0; i < NUM_INT_REGS; i++) begin
-                    if (commit_en && (commit_arch == i && commit_arch != 5'b0)) // When flush and commit are both true, roll back with the latest commit state
+                // Recovery: Restore from architectural vRAT, including the new commit
+                for (int i = 0; i < NUM_VEC_REGS; i++) begin
+                    if (commit_en && commit_arch == i) // When flush and commit are both true, roll back with the latest commit state
                         spec_rat[i] <= commit_phys;
                     else
                         spec_rat[i] <= arch_rat[i];
                 end
-            end else if (rename_en) begin // x0 permanently mapped to p0 in rat, but by not renaming, we pretend x0 is mapped to other physical regs when executing dest-less instructions
-                spec_rat[dst_arch] <= dst_phys; // Regular renaming: Register the mapping of the newly allocated free register
+            end else if (rename_en) begin // Regular renaming/mapping
+                spec_rat[dst_arch] <= dst_phys;
             end
         end
     end

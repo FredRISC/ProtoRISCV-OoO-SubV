@@ -206,7 +206,8 @@ module load_store_queue #(
     // ========================================================================
     // State Updates (Allocation, Memory Return, Commit, Retirement)
     // ========================================================================
-    
+    logic [LSQ_TAG_WIDTH-1:0] broadcast_idx;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush) begin
             for (int i = 0; i < LSQ_SIZE; i++) begin
@@ -327,8 +328,6 @@ module load_store_queue #(
     // ========================================================================
     // CDB Interface: Decoupled Broadcast Scanner
     // ========================================================================
-    
-    logic [LSQ_TAG_WIDTH-1:0] broadcast_idx;
     
     always @(*) begin
         lsq_data_out = 0;

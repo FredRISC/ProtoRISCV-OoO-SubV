@@ -28,6 +28,12 @@ module commit_stage #(
     output logic [XLEN-1:0] reg_write_data,
     output logic reg_write_en
 );
+    //logic commit_is_Vector_Store = (rob_instr_type == `V_EXT_STORE);
+    logic commit_is_Vector = (rob_instr_type == `V_EXT_VEC || rob_instr_type == `V_EXT_LOAD || 
+        rob_instr_type == `V_EXT_STORE); // vsetvli is handled as scalar since it writes to scalar rd 
+
+    logic scalar_wr_en = (rob_dest_reg != 5'b0 && !commit_is_Vector); // SKIP THE Dest-less INSTRUCTIONS using x0
+    logic vector_wr_en = (rob_instr_type == `V_EXT_VEC || rob_instr_type == `V_EXT_LOAD); // DON'T NEED TO UPDATE WHEN instr = V.STORE
 
     // Commit is purely combinational routing to the architectural register file
     always @(*) begin
@@ -36,11 +42,15 @@ module commit_stage #(
         reg_write_data = commit_read_data; // Data fetched from PRF
         commit_read_addr = rob_dest_phys;  // Tell PRF which register to read
         
-        // Only write if there is a valid commit, the destination is not x0,
-        // and it is a scalar integer instruction.
-        if (rob_valid && rob_dest_reg != 5'b0 && rob_instr_type != `V_EXT_VEC && rob_instr_type != `V_EXT_LOAD) begin
+        // Write to the scalar atchitectural register if there is a valid commit. 
+        // If the destination is x0, it means it's a dest-less instruction.
+        if (rob_valid && scalar_wr_en) begin
             reg_write_en = 1'b1;
             reg_write_addr = rob_dest_reg;
+        end
+
+        if(rob_valid && vector_wr_en) begin
+            // vector architectural registers update
         end
     end
 

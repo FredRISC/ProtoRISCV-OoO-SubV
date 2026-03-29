@@ -19,6 +19,7 @@ module reorder_buffer #(
     input [4:0] alloc_dest_reg,      // Architectural destination register (for commit_stage)
     input [5:0] alloc_phys_reg,      // Allocated physical destination register (for CDB, commit_stage)
     input [5:0] alloc_old_phys_reg,  // Old physical register to Free_List
+    input [31:0] alloc_vtype,        // Vector type state
 
     input alloc_valid,
     output rob_full,
@@ -40,7 +41,8 @@ module reorder_buffer #(
     output [3:0] commit_instr_type,
     output [4:0] commit_dest_reg,
     output [5:0] commit_dest_phys,   // Physical register to update Arch RAT
-    output [5:0] commit_old_phys     // Old physical register to return to Free List
+    output [5:0] commit_old_phys,     // Old physical register to return to Free List    
+    output [31:0] commit_vtype,      // To update vCSR
     
     // Flush outputs (to Main Controller)
     output rob_flush_req,            // Trigger pipeline flush
@@ -53,6 +55,7 @@ module reorder_buffer #(
         logic [4:0] dest_reg; // For update architectural register file in commit_stage
         logic [5:0] phys_reg; // For matching CDB result to ROB entry and for updating RAT on commit
         logic [5:0] old_phys_reg; // For freeing old phys reg on commit
+        logic [31:0] vtype;       // For updating architectural vtype
         logic memory_violation; // Set if LSQ detects out-of-order memory conflict
         logic result_ready; // signals instruction is ready to commit (stores/branches are ready immediately)
         logic valid; // signals this entry is allocated and valid
@@ -78,6 +81,7 @@ module reorder_buffer #(
                 rob_entries[i].dest_reg <= 5'b0;
                 rob_entries[i].phys_reg <= 6'b0;
                 rob_entries[i].old_phys_reg <= 6'b0;
+                rob_entries[i].vtype <= 32'b0;
                 rob_entries[i].memory_violation <= 1'b0;
                 rob_entries[i].result_ready <= 1'b0;
             end
@@ -121,6 +125,7 @@ module reorder_buffer #(
                 rob_entries[tail_ptr].dest_reg <= alloc_dest_reg;
                 rob_entries[tail_ptr].phys_reg <= alloc_phys_reg;
                 rob_entries[tail_ptr].old_phys_reg <= alloc_old_phys_reg;
+                rob_entries[tail_ptr].vtype <= alloc_vtype;
                 rob_entries[tail_ptr].result_ready <= 1'b0;
                 rob_entries[tail_ptr].memory_violation <= 1'b0;
                 rob_entries[tail_ptr].valid <= 1'b1;
@@ -132,7 +137,10 @@ module reorder_buffer #(
     // ========================================================================
     // Commit Logic (to commit_stage and LSQ)
     // ========================================================================
-    
+    logic head_is_Vector_Store = (rob_entries[head_ptr].instr_type == `V_EXT_STORE);
+    logic head_is_Vector = (rob_entries[head_ptr].instr_type == `V_EXT_VEC || rob_entries[head_ptr].instr_type == `V_EXT_LOAD || 
+        rob_entries[head_ptr].instr_type == `V_EXT_STORE); // vsetvli is handled as scalar since it writes to scalar rd 
+
     logic head_is_violator;
     assign head_is_violator = rob_entries[head_ptr].valid && rob_entries[head_ptr].memory_violation;
     
@@ -144,11 +152,17 @@ module reorder_buffer #(
     assign commit_instr_type = rob_entries[head_ptr].instr_type;
     assign commit_dest_reg = rob_entries[head_ptr].dest_reg;
     assign commit_dest_phys = rob_entries[head_ptr].phys_reg;
-    
-    // If dest_reg is x0, it's a store/branch. It consumed a physical register for tracking,
-    // but didn't update the RAT. We must free that newly allocated register directly.
-    assign commit_old_phys = (rob_entries[head_ptr].dest_reg == 5'b0) ? 
+
+    assign commit_old_phys = rob_entries[head_ptr].old_phys_reg; // already prepared in dispatch_stage for the dummy cases 
+    assign commit_vtype = rob_entries[head_ptr].vtype;
+
+    /*
+    // If dest_reg is x0, it's a dummy dest reg assignment. 
+    // It consumed a physical register that must be freed (current tag). Otherwise, free the old tag.
+    assign commit_old_phys = (rob_entries[head_ptr].dest_reg == 5'b0 && !head_is_Vector) ? 
                              rob_entries[head_ptr].phys_reg : 
                              rob_entries[head_ptr].old_phys_reg;
+    */
+
 
 endmodule
