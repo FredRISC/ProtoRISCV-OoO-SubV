@@ -58,6 +58,8 @@ module execute_stage #(
     // LSQ Tunneling (Dispatch <-> LSQ)
     input lsq_alloc_req,
     input lsq_alloc_is_store,
+    input lsq_alloc_is_vector,
+    input [31:0] lsq_alloc_vtype,
     input [2:0] lsq_alloc_size,
     input [5:0] alloc_phys_tag,
     output [LSQ_TAG_WIDTH-1:0] alloc_tag,
@@ -234,6 +236,8 @@ module execute_stage #(
         // Dispatch Allocation Interface (handled in Top/Dispatch, wired separately)
         .alloc_req(lsq_alloc_req), 
         .alloc_is_store(lsq_alloc_is_store),
+        .alloc_is_vector(lsq_alloc_is_vector),
+        .alloc_vtype(lsq_alloc_vtype),
         .alloc_size(lsq_alloc_size),
         .dispatch_phys_tag(alloc_phys_tag),
         .alloc_tag(alloc_tag),
@@ -243,6 +247,7 @@ module execute_stage #(
         .exe_addr(agu_addr),
         .exe_data(mem_op2[XLEN-1:0]), // TRUNCATED temporarily until VLSU is implemented
         .exe_lsq_tag(mem_lsq_tag),
+        .exe_vl(mem_vl),
         .exe_load_valid(mem_valid && exe_is_load),
         .exe_store_valid(mem_valid && exe_is_store),
         

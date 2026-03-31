@@ -49,6 +49,8 @@ module riscv_core_top (
     logic dispatch_rs_alloc, dispatch_rob_alloc, dispatch_lsq_alloc;
     logic dispatch_src1_valid, dispatch_src2_valid;
     logic dispatch_lsq_is_store;
+    logic dispatch_lsq_is_vector;
+    logic [31:0] dispatch_lsq_vtype;
     logic [LSQ_TAG_WIDTH-1:0] dispatch_lsq_tag, lsq_alloc_tag_from_exec;
     logic [2:0] dispatch_lsq_size;
     
@@ -281,6 +283,7 @@ module riscv_core_top (
         .rob_alloc_valid(dispatch_rob_alloc),
         .lsq_alloc_tag_in(lsq_alloc_tag_from_exec), .dispatch_lsq_tag(dispatch_lsq_tag), 
         .lsq_alloc_req(dispatch_lsq_alloc), .lsq_alloc_is_store(dispatch_lsq_is_store),
+        .lsq_alloc_is_vector(dispatch_lsq_is_vector), .lsq_alloc_vtype(dispatch_lsq_vtype),
         .lsq_alloc_size(dispatch_lsq_size)
     );
 
@@ -403,6 +406,7 @@ module riscv_core_top (
         .flush(flush_pipeline),
         // LSQ Allocation Tunneling
         .lsq_alloc_req(dispatch_lsq_alloc), .lsq_alloc_is_store(dispatch_lsq_is_store),
+        .lsq_alloc_is_vector(dispatch_lsq_is_vector), .lsq_alloc_vtype(dispatch_lsq_vtype),
         .lsq_alloc_size(dispatch_lsq_size),
         .alloc_phys_tag(rat_dst_phys), .alloc_tag(lsq_alloc_tag_from_exec),
         .lsq_full(lsq_full),

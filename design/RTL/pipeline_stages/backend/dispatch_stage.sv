@@ -73,6 +73,8 @@ module dispatch_stage #(
     output [LSQ_TAG_WIDTH-1:0] dispatch_lsq_tag, // Tag to RS
     output lsq_alloc_req, // Request for LSQ allocation
     output lsq_alloc_is_store, // Load or Store?
+    output lsq_alloc_is_vector, // Is vector load/store?
+    output [31:0] lsq_alloc_vtype, // Vtype for LSQ
     output [2:0] lsq_alloc_size, // funct3 to define byte/half/word
 
     // Commit Interface (ROB -> RAT Interface)
@@ -366,6 +368,8 @@ module dispatch_stage #(
     assign lsq_alloc_req = (is_load || is_store) && valid_in && !stall && !flush;
     assign lsq_alloc_is_store = is_store;
     assign lsq_alloc_size = funct3; // Record size at allocation!
+    assign lsq_alloc_is_vector = (is_vec_load || is_vec_store);
+    assign lsq_alloc_vtype = spec_vtype; // Known at dispatch
     assign dispatch_lsq_tag = lsq_alloc_tag_in;
     
     // All signals should be prepared in one cycle 

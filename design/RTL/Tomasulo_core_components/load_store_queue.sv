@@ -8,7 +8,8 @@
 
 module load_store_queue #(
     parameter LSQ_SIZE = 16,
-    parameter XLEN = 32
+    parameter XLEN = 32,
+    parameter DLEN = 128
 ) (
     input clk,
     input rst_n,
@@ -17,6 +18,8 @@ module load_store_queue #(
     // 1. Dispatch Allocation Interface (In-Order)
     input alloc_req,
     input alloc_is_store,
+    input alloc_is_vector, // NEW: Identify vector mem ops at dispatch
+    input [31:0] alloc_vtype, // NEW: vtype from dispatch
     input [2:0] alloc_size,
     input [5:0] dispatch_phys_tag, // Phys tag of the instruction to be sent to CDB
     output logic [LSQ_TAG_WIDTH-1:0] alloc_tag, // queue entry's id sent to dispatch_stage for matching after addr calculation
@@ -24,13 +27,14 @@ module load_store_queue #(
     
     // 2. Execution Interface (Out-of-Order Address Calculation)
     input [XLEN-1:0] exe_addr,  // Calculated address
-    input [XLEN-1:0] exe_data,  // Store data
+    input [DLEN-1:0] exe_data,  // Store data (Expanded to DLEN)
     input [LSQ_TAG_WIDTH-1:0] exe_lsq_tag, // Which entry to update? = earlier sent alloc_tag 
+    input [31:0] exe_vl,        // Vector Length arriving from Execute
     input exe_load_valid,
     input exe_store_valid,
     
     // 3. CDB Interface
-    output logic [XLEN-1:0] lsq_data_out, // Data to CDB 
+    output logic [DLEN-1:0] lsq_data_out, // Data to CDB (Expanded to DLEN)
     output logic [5:0] cdb_phys_tag_out, // PReg tag for CDB and ROB wakeup
     output logic lsq_out_valid, // Valid signal for CDB and ROB wakeup (stores also use this to wake up ROB)
     
@@ -65,8 +69,11 @@ module load_store_queue #(
     // ========================================================================
     typedef struct packed {
         logic is_store;
+        logic is_vector;            // Tracks if this is a VLE/VSE
         logic [XLEN-1:0] address;   // Target address for load/store
-        logic [XLEN-1:0] data;  // Data to store, or data loaded
+        logic [DLEN-1:0] data;      // Data to store, or data loaded (128-bit)
+        logic [31:0] vl;            // Vector Length (Number of elements)
+        logic [31:0] vtype;         // Vector Type (Contains SEW)
         logic [5:0] phys_tag; // Physical tag
         logic [2:0] mem_size; // Size and sign-extension behavior
         logic addr_valid;     // Is address ready?
@@ -115,6 +122,37 @@ module load_store_queue #(
     endfunction
     
     // ========================================================================
+    // Vector Memory Subsystem Helper Functions
+    // ========================================================================
+    function logic [XLEN-1:0] get_end_addr(input [XLEN-1:0] start_addr, input is_vec, input [31:0] vl, input [31:0] vtype, input [2:0] size);
+        logic [31:0] bytes_per_elem;
+        begin
+            if (is_vec) begin
+                case (vtype[5:3]) // SEW
+                    3'b000: bytes_per_elem = 1; // e8
+                    3'b001: bytes_per_elem = 2; // e16
+                    3'b010: bytes_per_elem = 4; // e32
+                    3'b011: bytes_per_elem = 8; // e64
+                    default: bytes_per_elem = 4;
+                endcase
+                get_end_addr = (vl == 0) ? start_addr : (start_addr + (vl * bytes_per_elem) - 1);
+            end else begin
+                case (size)
+                    3'b000, 3'b100: get_end_addr = start_addr; // Byte
+                    3'b001, 3'b101: get_end_addr = start_addr + 1; // Halfword
+                    default: get_end_addr = start_addr + 3; // Word
+                endcase
+            end
+        end
+    endfunction
+    
+    function logic [7:0] get_total_words(input [31:0] vl, input [31:0] vtype);
+        // Re-using the logic from above, total words = ceil((vl * bytes_per_elem) / 4)
+        logic [XLEN-1:0] end_offset = get_end_addr(0, 1'b1, vl, vtype, 3'b000);
+        get_total_words = (end_offset >> 2) + 1; 
+    endfunction
+
+    // ========================================================================
     // Load Request Selector (Scan from Head for Ready Loads) 
     // ========================================================================
     logic issue_load_ready;
@@ -141,9 +179,6 @@ module load_store_queue #(
                 issue_load_valid = 1'b1; // mark that we have a load to issue in the next cycle
                 break;
             end
-            else begin
-                issue_load_valid = 1'b0;
-            end
 
             if (ptr == tail) break;
         end
@@ -155,6 +190,8 @@ module load_store_queue #(
     // ========================================================================
     logic [XLEN-1:0] forwarded_data;
     logic forwarding_valid;
+    logic [XLEN-1:0] exe_end_addr;
+    logic [XLEN-1:0] ptr_end_addr;
     
     always @(*) begin
         flush_pipeline = 1'b0;
@@ -163,13 +200,15 @@ module load_store_queue #(
         forwarded_data = 0;
         
         if (exe_store_valid) begin // Check at the moment we receive the calculated st address from execute stage
-            // 1. DISAMBIGUATION
+            // 1. DISAMBIGUATION: Range Overlap Check
+            exe_end_addr = get_end_addr(exe_addr, lsq[exe_lsq_tag].is_vector, exe_vl, lsq[exe_lsq_tag].vtype, lsq[exe_lsq_tag].mem_size);
             for (int k = 1; k < LSQ_SIZE; k++) begin
                 logic [LSQ_TAG_WIDTH-1:0] ptr = exe_lsq_tag + k[LSQ_TAG_WIDTH-1:0]; //check younger load entries
                 
                 // check younger loads that has already calculated its address
                 if (lsq[ptr].valid && !lsq[ptr].is_store && lsq[ptr].addr_valid) begin
-                    if (lsq[ptr].address[XLEN-1:2] == exe_addr[XLEN-1:2]) begin
+                    ptr_end_addr = get_end_addr(lsq[ptr].address, lsq[ptr].is_vector, lsq[ptr].vl, lsq[ptr].vtype, lsq[ptr].mem_size);
+                    if ((lsq[ptr].address <= exe_end_addr) && (ptr_end_addr >= exe_addr)) begin
                         flush_pipeline = 1'b1;
                         lsq_violation_tag = lsq[ptr].phys_tag; // mark the younger load as violation
                     end
@@ -178,14 +217,17 @@ module load_store_queue #(
             end
         end 
         else if (exe_load_valid) begin // Check at the moment we receive the calculated ld address from execute stage
-            // 2. FORWARDING 
+            // 2. FORWARDING AND RANGE CONFLICTS
+            exe_end_addr = get_end_addr(exe_addr, lsq[exe_lsq_tag].is_vector, exe_vl, lsq[exe_lsq_tag].vtype, lsq[exe_lsq_tag].mem_size);
             for (int k = 1; k < LSQ_SIZE; k++) begin
                 logic [LSQ_TAG_WIDTH-1:0] ptr = exe_lsq_tag - k[LSQ_TAG_WIDTH-1:0]; //check older entries
                 
-                // If it's an older store with valid address, check for Word-Aligned Overlap
+                // If it's an older store with valid address, check for Range Overlap
                 if (lsq[ptr].valid && lsq[ptr].is_store && lsq[ptr].addr_valid) begin
-                    if (lsq[ptr].address[XLEN-1:2] == exe_addr[XLEN-1:2]) begin
-                        if (lsq[ptr].mem_size == 3'b010) begin // Assuming strict memory alignment, otherwise complex to forward and will create a long critcal path
+                    ptr_end_addr = get_end_addr(lsq[ptr].address, lsq[ptr].is_vector, lsq[ptr].vl, lsq[ptr].vtype, lsq[ptr].mem_size);
+                    if ((lsq[ptr].address <= exe_end_addr) && (ptr_end_addr >= exe_addr)) begin
+                        // Only forward if both are identical, scalar, word-aligned accesses
+                        if (!lsq[ptr].is_vector && !lsq[exe_lsq_tag].is_vector && (lsq[ptr].address == exe_addr) && (lsq[ptr].mem_size == 3'b010)) begin 
                             forwarded_data = lsq[ptr].data; 
                             forwarding_valid = 1'b1;
                         end 
@@ -207,6 +249,17 @@ module load_store_queue #(
     // State Updates (Allocation, Memory Return, Commit, Retirement)
     // ========================================================================
     logic [LSQ_TAG_WIDTH-1:0] broadcast_idx;
+    
+    // Vector FSM Registers
+    logic vec_load_active;
+    logic [7:0] vec_load_word_idx;
+    logic [7:0] vec_load_total_words = get_total_words(lsq[issue_load_idx].vl, lsq[issue_load_idx].vtype);;
+    logic vec_store_active;
+    logic [7:0] vec_store_word_idx;
+    logic [7:0] vec_store_total_words = get_total_words(lsq[head].vl, lsq[head].vtype);
+
+    logic [XLEN-1:0] read_addr;
+    logic read_en;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n || flush) begin
@@ -217,11 +270,18 @@ module load_store_queue #(
             tail <= 0;
             commit_ptr <= 0;
             mem_inflight_valid <= 1'b0;
+            vec_load_active <= 1'b0;
+            vec_load_word_idx <= 8'b0;
+            vec_store_active <= 1'b0;
+            vec_store_word_idx <= 8'b0;
         end else begin
             // 1. Allocation (Dispatch)
             if (alloc_req && !lsq_full) begin
                 lsq[tail].valid <= 1'b1;
                 lsq[tail].is_store <= alloc_is_store;
+                lsq[tail].is_vector <= alloc_is_vector;
+                lsq[tail].vl <= 32'b0;
+                lsq[tail].vtype <= alloc_vtype; // Vtype is established at allocation
                 lsq[tail].mem_size <= alloc_size; // Record data width at dispatch!
                 lsq[tail].phys_tag <= dispatch_phys_tag;
                 lsq[tail].addr_valid <= 1'b0;
@@ -236,9 +296,10 @@ module load_store_queue #(
             if (exe_load_valid) begin // Load address calculation has finished
                 lsq[exe_lsq_tag].address <= exe_addr; // Calculated load address
                 lsq[exe_lsq_tag].addr_valid <= 1'b1; // Mark the address as valid
+                lsq[exe_lsq_tag].vl <= exe_vl;
                 
                 if (forwarding_valid) begin
-                    lsq[exe_lsq_tag].data <= format_data(forwarded_data, lsq[exe_lsq_tag].mem_size , exe_addr[1:0]);
+                    lsq[exe_lsq_tag].data <= { {(DLEN-XLEN){1'b0}}, format_data(forwarded_data[XLEN-1:0], lsq[exe_lsq_tag].mem_size , exe_addr[1:0]) };
                     lsq[exe_lsq_tag].data_valid <= 1'b1;
                 end
                 // else: wait for memory read request issue/response
@@ -248,28 +309,52 @@ module load_store_queue #(
                 lsq[exe_lsq_tag].address <= exe_addr; // Calculated store address
                 lsq[exe_lsq_tag].data <= exe_data; // Data to be stored to Memory
                 lsq[exe_lsq_tag].addr_valid <= 1'b1; // Mark the address as valid
+                lsq[exe_lsq_tag].vl <= exe_vl;
                 lsq[exe_lsq_tag].data_valid <= 1'b1; // Mark the data as valid. 
                 // The store can wake up in ROB now, but remains in LSQ until retired/committed by ROB and issued to memory
             end
             
-            // 3. Issuing load memory request (setting mem_inflight_valid and tracking inflight request)
-            if (issue_load_valid) begin
-                dmem_read_addr <= lsq[issue_load_idx].address; // Drive the output read memory address for "a" cycle
-                dmem_read_en <= 1'b1;  // Drive the output read enable for "a" cycle
-                lsq[issue_load_idx].sent_to_mem <= 1'b1;
-                mem_inflight_idx <= issue_load_idx;
-                mem_inflight_valid <= 1'b1;
-            end
-            else begin
-                issue_load_idx <= issue_load_idx; // Hold the index steady when not issuing
-                dmem_read_en <= 1'b0; // De-assert read enable when not issuing a load
+            // 3. Issuing Load Memory Request FSM
+            dmem_read_en <= 1'b0; // Default de-assert 
+            if (issue_load_valid && !mem_inflight_valid) begin
+                lsq[issue_load_idx].sent_to_mem <= 1'b1; // Mark sent so scanner skips it
+                mem_inflight_idx <= issue_load_idx; // Record the idx of correponding lsq entry
+                dmem_read_addr <= lsq[issue_load_idx].address; // Start with the first word address
+                vec_load_word_idx <= 'd0;    
+                mem_inflight_valid <= 1'b1; // Request for the first/next vector element     
+                dmem_read_en <= 1'b1; // Pulled up for a cycle                                   
+                if (lsq[issue_load_idx].is_vector) begin
+                    vec_load_active <= 1'b1;
+                end
             end
             
             // 4. Receiving Load Memory Response
             if (dmem_read_valid && mem_inflight_valid) begin 
-                lsq[mem_inflight_idx].data <= format_data(dmem_read_data, lsq[mem_inflight_idx].mem_size, lsq[mem_inflight_idx].address[1:0]);
-                lsq[mem_inflight_idx].data_valid <= 1'b1;
-                mem_inflight_valid <= 1'b0; // Request done
+                if (vec_load_active) begin // vector load response handling (data comes back one word at a time)
+                    case (vec_load_word_idx)
+                        8'd0: lsq[mem_inflight_idx].data[31:0]   <= dmem_read_data; // or format_data(...) 
+                        8'd1: lsq[mem_inflight_idx].data[63:32]  <= dmem_read_data;
+                        8'd2: lsq[mem_inflight_idx].data[95:64]  <= dmem_read_data;
+                        8'd3: lsq[mem_inflight_idx].data[127:96] <= dmem_read_data;
+                    endcase
+                    
+                    if (vec_load_word_idx == (vec_load_total_words - 1) || vec_load_word_idx == (DLEN/32 - 1)) begin
+                        lsq[mem_inflight_idx].data_valid <= 1'b1; // This will prompt the change of issue_load_valid and issue_load_idx
+                        vec_load_word_idx <= 'd0;
+                        mem_inflight_valid <= 1'b0; 
+                        vec_load_active <= 1'b0; // Entire vector request done
+                    end 
+                    else begin
+                        vec_load_word_idx <= vec_load_word_idx + 1'd1; // Advance to next element
+                        dmem_read_addr <= lsq[mem_inflight_idx].address + ((vec_load_word_idx + 1'b1) << 2);
+                        dmem_read_en <= 1'b1;                                                
+                    end
+                end 
+                else begin // scalar load response finishes in one beat
+                    lsq[mem_inflight_idx].data <= { {(DLEN-XLEN){1'b0}}, format_data(dmem_read_data, lsq[mem_inflight_idx].mem_size, lsq[mem_inflight_idx].address[1:0]) };
+                    lsq[mem_inflight_idx].data_valid <= 1'b1;
+                    mem_inflight_valid <= 1'b0; // Scalar request done
+                end
             end
             
             // 5. Commit Pointer Advance 
@@ -280,13 +365,30 @@ module load_store_queue #(
             
             // 6. Memory Write & Queue Retirement (Popping Head)
             if (head != commit_ptr) begin // Head has been marked as committed
-                if (!lsq[head].is_store) begin // Load at head can retire as soon as committed (boradcast had happened so it can commit)
+                if (!lsq[head].is_store) begin // Load at head can retire as soon as committed (broadcast happened before this, so ROB can assert commit)
                     lsq[head].valid <= 1'b0; // Free the entry
                     head <= head + 1; // Advance head pointer
-                end 
-                else if (lsq[head].committed && dmem_write_ready) begin // Store at head retires when memory accepts it
-                    lsq[head].valid <= 1'b0;
-                    head <= head + 1;
+                end else begin
+                    if (lsq[head].is_vector) begin
+                        if (!vec_store_active) begin
+                            vec_store_active <= 1'b1; // Trigger vector store enable (below always block)
+                            vec_store_word_idx <= 'd0;
+                        end 
+                        else if (dmem_write_ready) begin // Memory has consumed an element request
+                            if (vec_store_word_idx == (vec_store_total_words - 1) || vec_store_word_idx == (DLEN/32 - 1)) begin
+                                vec_store_active <= 1'b0; // Vector Store completely finished
+                                lsq[head].valid <= 1'b0; // Retire head
+                                head <= head + 1; // Advance head pointer
+                            end 
+                            else begin
+                                vec_store_word_idx <= vec_store_word_idx + 1; // Advance to next 32-bit chunk
+                            end
+                        end
+                    end 
+                    else if (lsq[head].committed && dmem_write_ready) begin // Scalar store
+                        lsq[head].valid <= 1'b0;
+                        head <= head + 1;
+                    end
                 end
             end
             
@@ -301,8 +403,6 @@ module load_store_queue #(
     // ========================================================================
     // Store Operation: Drive Memory Write Port
     // ========================================================================
-    assign dmem_write_en = lsq[head].is_store && lsq[head].committed; // don't need to check addr/data valid here
-    assign dmem_write_addr = {lsq[head].address[XLEN-1:2], 2'b00}; // Word-aligned memory bus
     
     logic [1:0] byte_offset;
     assign byte_offset = lsq[head].address[1:0];
@@ -311,17 +411,38 @@ module load_store_queue #(
     always @(*) begin
         dmem_be = 4'b0000;
         dmem_write_data = 32'h0;
-        if(lsq[head].mem_size == 3'b000) begin // SB (Store Byte)
-            dmem_be = 4'b0001 << byte_offset; 
-            dmem_write_data = {4{lsq[head].data[7:0]}}; // Replicate byte, dmem_be masks it
+        dmem_write_addr = 32'h0;
+        dmem_write_en = 1'b0;
+        
+        if (lsq[head].is_vector) begin
+            dmem_write_addr = lsq[head].address + (vec_store_word_idx << 2);
+            dmem_be = 4'b1111; // Vector accesses assumed word-aligned (full byte enable) for this FSM prototype
+            dmem_write_en = lsq[head].is_store && lsq[head].committed && vec_store_active && dmem_write_ready; 
+
+            case (vec_store_word_idx)
+                8'd0: dmem_write_data = lsq[head].data[31:0];
+                8'd1: dmem_write_data = lsq[head].data[63:32];
+                8'd2: dmem_write_data = lsq[head].data[95:64];
+                8'd3: dmem_write_data = lsq[head].data[127:96];
+                default: dmem_write_data = 32'h0;
+            endcase
+            
         end 
-        else if(lsq[head].mem_size == 3'b001) begin // SH (Store Halfword)
-            dmem_be = byte_offset[1] ? 4'b1100 : 4'b0011; // RISC-V specifies halfwords must be 2-byte aligned. byte_offset[0] is ignored.
-            dmem_write_data = {2{lsq[head].data[15:0]}};
-        end 
-        else begin // SW (Store Word)
-            dmem_be = 4'b1111;
-            dmem_write_data = lsq[head].data;
+        else begin
+            dmem_write_addr = {lsq[head].address[XLEN-1:2], 2'b00}; // Word-aligned memory bus
+            dmem_write_en = lsq[head].is_store && lsq[head].committed && dmem_write_ready; // Pulled up only for a cycle
+            if(lsq[head].mem_size == 3'b000) begin // SB (Store Byte)
+                dmem_be = 4'b0001 << byte_offset; 
+                dmem_write_data = {4{lsq[head].data[7:0]}}; // Replicate byte, dmem_be masks it
+            end 
+            else if(lsq[head].mem_size == 3'b001) begin // SH (Store Halfword)
+                dmem_be = byte_offset[1] ? 4'b1100 : 4'b0011; // RISC-V specifies halfwords must be 2-byte aligned. byte_offset[0] is ignored.
+                dmem_write_data = {2{lsq[head].data[15:0]}};
+            end 
+            else begin // SW (Store Word)
+                dmem_be = 4'b1111;
+                dmem_write_data = lsq[head].data[XLEN-1:0];
+            end
         end
     end
 

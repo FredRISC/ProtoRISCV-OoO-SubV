@@ -89,15 +89,21 @@ module reorder_buffer #(
             tail_ptr <= 0;
         end else begin
             
-            // 1. Commit Stage (Free head entry)
-            // Note: Since head and tail can never be the same when allocating/committing 
-            // (unless ROB size is 1), we don't have write conflicts.
-            if (commit_valid) begin
-                rob_entries[head_ptr].valid <= 1'b0;
-                head_ptr <= head_ptr + 1;
-            end
+            // 1. Allocation (Allocate at tail)
+            if (alloc_valid && !rob_full) begin
+                rob_entries[tail_ptr].pc <= alloc_pc;
+                rob_entries[tail_ptr].instr_type <= alloc_instr_type;
+                rob_entries[tail_ptr].dest_reg <= alloc_dest_reg;
+                rob_entries[tail_ptr].phys_reg <= alloc_phys_reg;
+                rob_entries[tail_ptr].old_phys_reg <= alloc_old_phys_reg;
+                rob_entries[tail_ptr].vtype <= alloc_vtype;
+                rob_entries[tail_ptr].result_ready <= 1'b0;
+                rob_entries[tail_ptr].memory_violation <= 1'b0;
+                rob_entries[tail_ptr].valid <= 1'b1;
+                tail_ptr <= next_tail;
+            end        
             
-            // 2. Receiving Tags (Update ready bits)
+            // 2. Receiving Tags (sweeping all ROB entries to update ready bits)
             for (int i = 0; i < ROB_SIZE; i++) begin
                 if (rob_entries[i].valid && !rob_entries[i].result_ready) begin
                     if (result0_valid && (rob_entries[i].phys_reg == result0_tag)) begin
@@ -117,19 +123,11 @@ module reorder_buffer #(
                     end
                 end
             end
-            
-            // 4. Allocation (Allocate at tail)
-            if (alloc_valid && !rob_full) begin
-                rob_entries[tail_ptr].pc <= alloc_pc;
-                rob_entries[tail_ptr].instr_type <= alloc_instr_type;
-                rob_entries[tail_ptr].dest_reg <= alloc_dest_reg;
-                rob_entries[tail_ptr].phys_reg <= alloc_phys_reg;
-                rob_entries[tail_ptr].old_phys_reg <= alloc_old_phys_reg;
-                rob_entries[tail_ptr].vtype <= alloc_vtype;
-                rob_entries[tail_ptr].result_ready <= 1'b0;
-                rob_entries[tail_ptr].memory_violation <= 1'b0;
-                rob_entries[tail_ptr].valid <= 1'b1;
-                tail_ptr <= next_tail;
+
+            // 4. Commit Stage (Free head entry)
+            if (commit_valid) begin
+                rob_entries[head_ptr].valid <= 1'b0;
+                head_ptr <= head_ptr + 1;
             end
         end
     end
@@ -137,9 +135,6 @@ module reorder_buffer #(
     // ========================================================================
     // Commit Logic (to commit_stage and LSQ)
     // ========================================================================
-    logic head_is_Vector_Store = (rob_entries[head_ptr].instr_type == `V_EXT_STORE);
-    logic head_is_Vector = (rob_entries[head_ptr].instr_type == `V_EXT_VEC || rob_entries[head_ptr].instr_type == `V_EXT_LOAD || 
-        rob_entries[head_ptr].instr_type == `V_EXT_STORE); // vsetvli is handled as scalar since it writes to scalar rd 
 
     logic head_is_violator;
     assign head_is_violator = rob_entries[head_ptr].valid && rob_entries[head_ptr].memory_violation;
@@ -155,14 +150,5 @@ module reorder_buffer #(
 
     assign commit_old_phys = rob_entries[head_ptr].old_phys_reg; // already prepared in dispatch_stage for the dummy cases 
     assign commit_vtype = rob_entries[head_ptr].vtype;
-
-    /*
-    // If dest_reg is x0, it's a dummy dest reg assignment. 
-    // It consumed a physical register that must be freed (current tag). Otherwise, free the old tag.
-    assign commit_old_phys = (rob_entries[head_ptr].dest_reg == 5'b0 && !head_is_Vector) ? 
-                             rob_entries[head_ptr].phys_reg : 
-                             rob_entries[head_ptr].old_phys_reg;
-    */
-
 
 endmodule
