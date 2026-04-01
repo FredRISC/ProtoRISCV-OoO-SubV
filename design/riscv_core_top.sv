@@ -86,10 +86,14 @@ module riscv_core_top (
     logic [5:0] cdb1_tag;
     logic cdb1_valid;
     
-    // Vector CDB
-    logic [VLEN-1:0] vec_cdb_result;
-    logic [5:0] vec_cdb_tag;
-    logic vec_cdb_valid;
+    // Vector CDBs
+    logic [VLEN-1:0] vec_cdb0_result;
+    logic [5:0] vec_cdb0_tag;
+    logic vec_cdb0_valid;
+    
+    logic [VLEN-1:0] vec_cdb1_result;
+    logic [5:0] vec_cdb1_tag;
+    logic vec_cdb1_valid;
     
     // Vector CSR Signals
     logic [5:0] spec_vl_tag;
@@ -211,7 +215,7 @@ module riscv_core_top (
     physical_register_file #(.NUM_PHYS_REGS(NUM_PHYS_REGS), .XLEN(XLEN))
     phys_regfile_inst (.clk(clk), .rst_n(rst_n),
         .write_addr0(cdb0_tag), .write_data0(cdb0_result), .write_en0(cdb0_valid),
-        .write_addr1(cdb1_tag), .write_data1(cdb1_result), .write_en1(cdb1_valid),
+        .write_addr1(vec_cdb1_tag), .write_data1(vec_cdb1_result), .write_en1(vec_cdb1_valid),
         .read_addrs(prf_read_addrs), .read_datas(prf_read_datas),
         .commit_read_addr(commit_read_addr_wire),
         .commit_read_data(phys_reg_data_commit),
@@ -261,6 +265,8 @@ module riscv_core_top (
 
     logic dispatch_src1_valid_wire;
     logic dispatch_src2_valid_wire;
+    logic dispatch_src1_is_vec;
+    logic dispatch_src2_is_vec;
     assign dispatch_src1_valid_wire = (decode_instr_type == `V_EXT_VEC) ? vphys_reg_status[rat_src1_phys] : phys_reg_status[rat_src1_phys];
     assign dispatch_src2_valid_wire = (decode_instr_type == `V_EXT_VEC || decode_instr_type == `V_EXT_STORE) ? vphys_reg_status[rat_src2_phys] : phys_reg_status[rat_src2_phys];
 
@@ -275,6 +281,7 @@ module riscv_core_top (
         .imm_out(dispatch_imm), .pc_out(dispatch_pc),
         .use_rs1_out(dispatch_use_rs1), .use_rs2_out(dispatch_use_rs2), .use_pc_out(dispatch_use_pc),
         .use_vl_out(dispatch_use_vl),
+        .dispatch_src1_is_vec(dispatch_src1_is_vec), .dispatch_src2_is_vec(dispatch_src2_is_vec),
         .spec_vtype(spec_vtype), .vtype_out(dispatch_vtype),
         .vtype_update_en(vtype_update_en), .new_vtype(new_vtype),
         .dest_reg(dispatch_dest_reg),
@@ -305,10 +312,12 @@ module riscv_core_top (
         .dispatch_use_vl(dispatch_use_vl), .dispatch_vl_tag(spec_vl_tag), .dispatch_vl_valid(phys_reg_status[spec_vl_tag]),
         .dispatch_imm(dispatch_imm), .dispatch_vtype(dispatch_vtype), .dispatch_pc(dispatch_pc),
         .dispatch_alu_op(dispatch_alu_op), .dispatch_dest_tag(rat_dst_phys),
+        .dispatch_src1_is_vec(dispatch_src1_is_vec), .dispatch_src2_is_vec(dispatch_src2_is_vec),
         .dispatch_lsq_tag(dispatch_lsq_tag),
         .cdb0_tag(cdb0_tag), .cdb0_valid(cdb0_valid),
         .cdb1_tag(cdb1_tag), .cdb1_valid(cdb1_valid),
-        .vec_cdb_tag(vec_cdb_tag), .vec_cdb_valid(vec_cdb_valid),
+        .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_valid(vec_cdb0_valid),
+        .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_valid(vec_cdb1_valid),
         .mem_fu_ready(1'b1), // Because hazard_detection.sv strictly prevents Dispatch if the LSQ is full; Essentially issuing to ALU (AGU)
         .div_fu_ready(1'b1), // Replace with actual DIV busy signal if unpipelined
         .vec_fu_ready(1'b1), // VEU is one cycle now; Need optimization for high-latency operations like VMUL/VDIV
@@ -364,7 +373,8 @@ module riscv_core_top (
         .vprf_read_data1(vprf_read_data1), .vprf_read_data2(vprf_read_data2), .vprf_read_data3(vprf_read_data3),
         .cdb0_valid(cdb0_valid), .cdb0_tag(cdb0_tag), .cdb0_result(cdb0_result),
         .cdb1_valid(cdb1_valid), .cdb1_tag(cdb1_tag), .cdb1_result(cdb1_result),
-        .vec_cdb_valid(vec_cdb_valid), .vec_cdb_tag(vec_cdb_tag), .vec_cdb_result(vec_cdb_result),
+        .vec_cdb0_valid(vec_cdb0_valid), .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_result(vec_cdb0_result),
+        .vec_cdb1_valid(vec_cdb1_valid), .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_result(vec_cdb1_result),
         .alu_valid_exec(alu_valid), .mem_valid_exec(mem_valid), .mul_valid_exec(mul_valid), .div_valid_exec(div_valid), .vec_valid_exec(vec_valid),
         .alu_op1_exec(alu_op1), .alu_op2_exec(alu_op2), .mem_op1_exec(mem_op1), .mem_op2_exec(mem_op2), .mem_imm_exec(mem_imm_exec), .mem_vl_exec(mem_vl_exec),
         .mul_op1_exec(mul_op1), .mul_op2_exec(mul_op2), .div_op1_exec(div_op1), .div_op2_exec(div_op2),
@@ -388,6 +398,8 @@ module riscv_core_top (
         .alloc_valid(dispatch_rob_alloc), .alloc_vtype(new_vtype), .rob_full(rob_full),
         .result0_tag(cdb0_tag), .result0_valid(cdb0_valid),
         .result1_tag(cdb1_tag), .result1_valid(cdb1_valid),
+        .vec_result0_tag(vec_cdb0_tag), .vec_result0_valid(vec_cdb0_valid),
+        .vec_result1_tag(vec_cdb1_tag), .vec_result1_valid(vec_cdb1_valid),
         .lsq_violation_req(lsq_flush_req), .lsq_violation_tag(lsq_violation_tag),
         .commit_valid(rob_commit_valid), .commit_instr_type(rob_commit_instr_type),
         .commit_dest_arch(rob_commit_dest_arch_reg),
@@ -428,7 +440,8 @@ module riscv_core_top (
         .lsq_flush(lsq_flush_req), .lsq_violation_tag(lsq_violation_tag),
         .cdb0_result(cdb0_result), .cdb0_tag(cdb0_tag), .cdb0_valid(cdb0_valid),
         .cdb1_result(cdb1_result), .cdb1_tag(cdb1_tag), .cdb1_valid(cdb1_valid),
-        .vec_cdb_result(vec_cdb_result), .vec_cdb_tag(vec_cdb_tag), .vec_cdb_valid(vec_cdb_valid));
+        .vec_cdb0_result(vec_cdb0_result), .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_valid(vec_cdb0_valid),
+        .vec_cdb1_result(vec_cdb1_result), .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_valid(vec_cdb1_valid));
 
     // ========================================================================
     // STAGE 5: WRITEBACK (Inside execute_stage)

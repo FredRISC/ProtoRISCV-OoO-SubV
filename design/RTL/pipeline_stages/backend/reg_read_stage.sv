@@ -72,9 +72,13 @@ module reg_read_stage #(
     input [RS_TAG_WIDTH-1:0] cdb1_tag,
     input [XLEN-1:0] cdb1_result,
     
-    input vec_cdb_valid,
-    input [RS_TAG_WIDTH-1:0] vec_cdb_tag,
-    input [VLEN-1:0] vec_cdb_result,
+    input vec_cdb0_valid,
+    input [RS_TAG_WIDTH-1:0] vec_cdb0_tag,
+    input [VLEN-1:0] vec_cdb0_result,
+    
+    input vec_cdb1_valid,
+    input [RS_TAG_WIDTH-1:0] vec_cdb1_tag,
+    input [VLEN-1:0] vec_cdb1_result,
 
     // --------------------------------------------------------------------
     // Interfaces to Execute Stage (Actual Data Payloads)
@@ -159,7 +163,8 @@ module reg_read_stage #(
             // VL Bypass
             mem_vl_bypassed = prf_read_datas[8]; // VL already ready from RS
             // Vector Store Data Bypass (from vec_cdb or vector PRF)
-            if (vec_cdb_valid && vec_cdb_tag == mem_issue_src2_tag) mem_vec_src2_bypassed = vec_cdb_result;
+            if (vec_cdb0_valid && vec_cdb0_tag == mem_issue_src2_tag) mem_vec_src2_bypassed = vec_cdb0_result;
+            else if (vec_cdb1_valid && vec_cdb1_tag == mem_issue_src2_tag) mem_vec_src2_bypassed = vec_cdb1_result;
             else mem_vec_src2_bypassed = vprf_read_data3;
         end else begin
             mem_vl_bypassed = 32'b0;
@@ -191,10 +196,12 @@ module reg_read_stage #(
 
     // VEC Payload (Bypasses via dedicated Vector CDB)
     always @(*) begin
-        if (vec_cdb_valid && vec_cdb_tag == vec_issue_src1_tag) vec_src1_bypassed = vec_cdb_result;
+        if (vec_cdb0_valid && vec_cdb0_tag == vec_issue_src1_tag) vec_src1_bypassed = vec_cdb0_result;
+        else if (vec_cdb1_valid && vec_cdb1_tag == vec_issue_src1_tag) vec_src1_bypassed = vec_cdb1_result;
         else vec_src1_bypassed = vprf_read_data1;
 
-        if (vec_cdb_valid && vec_cdb_tag == vec_issue_src2_tag) vec_src2_bypassed = vec_cdb_result;
+        if (vec_cdb0_valid && vec_cdb0_tag == vec_issue_src2_tag) vec_src2_bypassed = vec_cdb0_result;
+        else if (vec_cdb1_valid && vec_cdb1_tag == vec_issue_src2_tag) vec_src2_bypassed = vec_cdb1_result;
         else vec_src2_bypassed = vprf_read_data2;
         
         if (!vec_use_vl) vec_vl_bypassed = 32'b0;

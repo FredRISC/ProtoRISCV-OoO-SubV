@@ -33,11 +33,17 @@ module load_store_queue #(
     input exe_load_valid,
     input exe_store_valid,
     
-    // 3. CDB Interface
-    output logic [DLEN-1:0] lsq_data_out, // Data to CDB (Expanded to DLEN)
+    // 3. CDB 1 Interface
+    // Scalar CDB Port (for scalar loads and all stores)
+    output logic [XLEN-1:0] lsq_data_out, // Data to CDB
     output logic [5:0] cdb_phys_tag_out, // PReg tag for CDB and ROB wakeup
     output logic lsq_out_valid, // Valid signal for CDB and ROB wakeup (stores also use this to wake up ROB)
     
+    // Vector CDB Port (for vector loads)
+    output logic [DLEN-1:0] vec_lsq_data_out,
+    output logic [5:0] vec_cdb_phys_tag_out,
+    output logic vec_lsq_out_valid,
+
     // 4. Commit Interface
     input commit_lsq, // From ROB/Commit: Retire the oldest load/store
     
@@ -74,6 +80,7 @@ module load_store_queue #(
         logic [DLEN-1:0] data;      // Data to store, or data loaded (128-bit)
         logic [31:0] vl;            // Vector Length (Number of elements)
         logic [31:0] vtype;         // Vector Type (Contains SEW)
+        logic [XLEN-1:0] stride;    // NEW: Byte stride between elements
         logic [5:0] phys_tag; // Physical tag
         logic [2:0] mem_size; // Size and sign-extension behavior
         logic addr_valid;     // Is address ready?
@@ -150,6 +157,19 @@ module load_store_queue #(
         // Re-using the logic from above, total words = ceil((vl * bytes_per_elem) / 4)
         logic [XLEN-1:0] end_offset = get_end_addr(0, 1'b1, vl, vtype, 3'b000);
         get_total_words = (end_offset >> 2) + 1; 
+    endfunction
+    
+    function logic [XLEN-1:0] get_stride(input [31:0] vtype);
+        // Default unit-stride based on SEW
+        begin
+            case (vtype[5:3])
+                3'b000: get_stride = 32'd1; // e8
+                3'b001: get_stride = 32'd2; // e16
+                3'b010: get_stride = 32'd4; // e32
+                3'b011: get_stride = 32'd8; // e64
+                default: get_stride = 32'd4;
+            endcase
+        end
     endfunction
 
     // ========================================================================
@@ -282,6 +302,7 @@ module load_store_queue #(
                 lsq[tail].is_vector <= alloc_is_vector;
                 lsq[tail].vl <= 32'b0;
                 lsq[tail].vtype <= alloc_vtype; // Vtype is established at allocation
+                lsq[tail].stride <= get_stride(alloc_vtype); // Default unit-stride. Will be overwritten by exe_data for vlse32.v
                 lsq[tail].mem_size <= alloc_size; // Record data width at dispatch!
                 lsq[tail].phys_tag <= dispatch_phys_tag;
                 lsq[tail].addr_valid <= 1'b0;
@@ -345,8 +366,8 @@ module load_store_queue #(
                         vec_load_active <= 1'b0; // Entire vector request done
                     end 
                     else begin
-                        vec_load_word_idx <= vec_load_word_idx + 1'd1; // Advance to next element
-                        dmem_read_addr <= lsq[mem_inflight_idx].address + ((vec_load_word_idx + 1'b1) << 2);
+                        vec_load_word_idx <= vec_load_word_idx + 'd1; // Advance to next element
+                        dmem_read_addr <= lsq[mem_inflight_idx].address + ((vec_load_word_idx + 'd1) * lsq[mem_inflight_idx].stride);
                         dmem_read_en <= 1'b1;                                                
                     end
                 end 
@@ -381,7 +402,7 @@ module load_store_queue #(
                                 head <= head + 1; // Advance head pointer
                             end 
                             else begin
-                                vec_store_word_idx <= vec_store_word_idx + 1; // Advance to next 32-bit chunk
+                                vec_store_word_idx <= vec_store_word_idx + 'd1; // Advance to next 32-bit chunk
                             end
                         end
                     end 
@@ -394,7 +415,7 @@ module load_store_queue #(
             
             // 7. CDB Broadcast Acknowledgment
             // Mark the entry as broadcasted so the decoupled scanner moves to the next one.
-            if (lsq_out_valid) begin
+            if (lsq_out_valid || (vec_lsq_out_valid)) begin
                 lsq[broadcast_idx].broadcasted <= 1'b1;
             end
         end
@@ -415,7 +436,7 @@ module load_store_queue #(
         dmem_write_en = 1'b0;
         
         if (lsq[head].is_vector) begin
-            dmem_write_addr = lsq[head].address + (vec_store_word_idx << 2);
+            dmem_write_addr = lsq[head].address + (vec_store_word_idx * lsq[head].stride);
             dmem_be = 4'b1111; // Vector accesses assumed word-aligned (full byte enable) for this FSM prototype
             dmem_write_en = lsq[head].is_store && lsq[head].committed && vec_store_active && dmem_write_ready; 
 
@@ -454,20 +475,31 @@ module load_store_queue #(
         lsq_data_out = 0;
         lsq_out_valid = 1'b0;
         cdb_phys_tag_out = 0;
+        vec_lsq_data_out = 0;
+        vec_lsq_out_valid = 1'b0;
+        vec_cdb_phys_tag_out = 0;
         broadcast_idx = 0;
         
         // Scan from Head to Tail for oldest un-broadcasted ready entry
         for (int i = 0; i < LSQ_SIZE; i++) begin
             logic [LSQ_TAG_WIDTH-1:0] ptr = head + i[LSQ_TAG_WIDTH-1:0];
             
-            // Broadcast when load has valid data or store has valid address
+            // An entry is ready to broadcast when:
+            // - A load has its data ready from memory.
+            // - A store has its address ready from the AGU.
             if (lsq[ptr].valid && !lsq[ptr].broadcasted) begin
                 if ((!lsq[ptr].is_store && lsq[ptr].data_valid) || 
                     (lsq[ptr].is_store && lsq[ptr].addr_valid)) begin
                     
-                    lsq_out_valid = 1'b1;
-                    cdb_phys_tag_out = lsq[ptr].phys_tag;
-                    lsq_data_out = lsq[ptr].data; // Already cleanly formatted!
+                    if (lsq[ptr].is_vector && !lsq[ptr].is_store) begin // Vector Load -> Vector CDB
+                        vec_lsq_out_valid = 1'b1;
+                        vec_cdb_phys_tag_out = lsq[ptr].phys_tag;
+                        vec_lsq_data_out = lsq[ptr].data;
+                    end else begin // Scalar Load or any Store -> Scalar CDB
+                        lsq_out_valid = 1'b1;
+                        cdb_phys_tag_out = lsq[ptr].phys_tag;
+                        lsq_data_out = lsq[ptr].data[XLEN-1:0]; // Truncate for scalar bus
+                    end
                     broadcast_idx = ptr;
                     break;
                 end

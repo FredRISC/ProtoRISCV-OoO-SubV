@@ -60,6 +60,8 @@ module dispatch_stage #(
     output use_rs2_out,
     output use_pc_out,
     output use_vl_out,
+    output dispatch_src1_is_vec,
+    output dispatch_src2_is_vec,
     
     // Vector CSR Interface
     input [31:0] spec_vtype, // Only read from CSR
@@ -231,6 +233,10 @@ module dispatch_stage #(
     assign use_pc_out = (instr_type == `IBASE_AUIPC || instr_type == `IBASE_JAL || instr_type == `IBASE_JALR || instr_type == `IBASE_BRANCH);
     assign use_vl_out = (instr_type == `V_EXT_VEC || instr_type == `V_EXT_LOAD || instr_type == `V_EXT_STORE);
     
+    // Pass domain tags to RS for correct CDB snooping
+    assign dispatch_src1_is_vec = is_vec_arith;
+    assign dispatch_src2_is_vec = (is_vec_arith || is_vec_store);
+    
     // VSETVLI Speculative Execution trigger
     assign vtype_update_en = (instr_type == `V_EXT_CONFIG) && valid_in && !stall && !flush;
     assign new_vtype = {21'b0, zimm}; // Extract zimm[10:0]
@@ -276,26 +282,22 @@ module dispatch_stage #(
             // OPMVV uses funct = 3'b010 - (Miscellaneous) Mask/Permutation Vector-Vector
             // OPIVX and OPMVV will be implemented in the future
 
-            if (funct3 == 3'b000 || funct3 == 3'b011) begin // OPIVV or OPIVI
-                case (funct7[6:1]) // funct6 is top 6 bits of funct7
-                    6'b000000: alu_op = `VEC_OP_ADD;
-                    6'b000010: alu_op = `VEC_OP_SUB;
-                    6'b100101: begin // This funct6 is shared by VMUL.VV and VSLL.VV
-                        case(funct3)
-                            3'b010: alu_op = `VEC_OP_MUL; // VMUL.VV (OPMVV)
-                            3'b000: alu_op = `VEC_OP_SLL; // VSLL.VV (OPIVV)
-                            default: alu_op = `UNKNOWN_VEC_OP;
-                        endcase
-                    end
-                    6'b001001: alu_op = `VEC_OP_AND;
-                    6'b001010: alu_op = `VEC_OP_OR;
-                    6'b001011: alu_op = `VEC_OP_XOR;
-                    6'b101000: alu_op = `VEC_OP_SRL;
-                    default:   alu_op = `UNKNOWN_VEC_OP; // Default for unhandled funct6
-                endcase
-            end else begin
-                alu_op = `UNKNOWN_VEC_OP;
-            end
+            case (funct7[6:1]) // funct6 is top 6 bits of funct7
+                6'b000000: alu_op = `VEC_OP_ADD;
+                6'b000010: alu_op = `VEC_OP_SUB;
+                6'b100101: begin // This funct6 is shared by VMUL.VV and VSLL.VV
+                    // For this funct6, we must disambiguate using funct3
+                    if (funct3 == 3'b000) alu_op = `VEC_OP_SLL;      // vsll.vv
+                    else if (funct3 == 3'b010) alu_op = `VEC_OP_MUL; // vmul.vv
+                    else alu_op = `UNKNOWN_VEC_OP;
+                end
+                6'b001001: alu_op = `VEC_OP_AND;
+                6'b001010: alu_op = `VEC_OP_OR;
+                6'b001011: alu_op = `VEC_OP_XOR;
+                6'b101000: alu_op = `VEC_OP_SRL;
+                6'b101001: alu_op = `VEC_OP_SRA; // vsra.vv
+                default:   alu_op = `UNKNOWN_VEC_OP; // Default for unhandled funct6
+            endcase
         end else if (instr_type == `IBASE_ALU || instr_type == `IBASE_ALU_IMM) begin
             // Scalar ALU Operation Decoding (R-Type and I-Type)
             case (funct3)

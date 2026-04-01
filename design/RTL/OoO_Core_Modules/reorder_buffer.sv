@@ -32,6 +32,14 @@ module reorder_buffer #(
     input [5:0] result1_tag,  
     input result1_valid, 
     
+    // Vector Result interface 0 (from VEU)
+    input [5:0] vec_result0_tag,
+    input vec_result0_valid,
+    
+    // Vector Result interface 1 (from LSQ)
+    input [5:0] vec_result1_tag,
+    input vec_result1_valid,
+    
     // Disambiguation Violation (from LSQ)
     input lsq_violation_req,
     input [5:0] lsq_violation_tag,
@@ -106,11 +114,19 @@ module reorder_buffer #(
             // 2. Receiving Tags (sweeping all ROB entries to update ready bits)
             for (int i = 0; i < ROB_SIZE; i++) begin
                 if (rob_entries[i].valid && !rob_entries[i].result_ready) begin
-                    if (result0_valid && (rob_entries[i].phys_reg == result0_tag)) begin
-                        rob_entries[i].result_ready <= 1'b1;
-                    end 
-                    else if (result1_valid && (rob_entries[i].phys_reg == result1_tag)) begin
-                        rob_entries[i].result_ready <= 1'b1;
+                    // Check domain based on instruction type
+                    if (rob_entries[i].instr_type == `V_EXT_VEC || rob_entries[i].instr_type == `V_EXT_LOAD) begin
+                        if (vec_result0_valid && (rob_entries[i].phys_reg == vec_result0_tag)) begin
+                            rob_entries[i].result_ready <= 1'b1;
+                        end else if (vec_result1_valid && (rob_entries[i].phys_reg == vec_result1_tag)) begin
+                            rob_entries[i].result_ready <= 1'b1;
+                        end
+                    end else begin
+                        if (result0_valid && (rob_entries[i].phys_reg == result0_tag)) begin
+                            rob_entries[i].result_ready <= 1'b1;
+                        end else if (result1_valid && (rob_entries[i].phys_reg == result1_tag)) begin
+                            rob_entries[i].result_ready <= 1'b1;
+                        end
                     end
                 end
             end

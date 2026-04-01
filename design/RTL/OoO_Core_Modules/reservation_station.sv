@@ -27,24 +27,26 @@ module reservation_station #(
     input [RS_TAG_WIDTH-1:0] vl_tag_in,
     input vl_valid_in,
     input use_vl_in,
+    input src1_is_vec_in,
+    input src2_is_vec_in,
     input [XLEN-1:0] imm_data, // Constant payload
     input [XLEN-1:0] vtype_data, // For vector instructions
-    input [XLEN-1:0] pc_data,  // Constant payload
-    input [3:0] alu_op,
-    input dispatch_valid,
-    input [RS_TAG_WIDTH-1:0] dest_tag_in, // Tag assigned to the instruction; used for CDB broadcast
-    input [LSQ_TAG_WIDTH-1:0] lsq_tag_in, // Tag for LSQ entry (if load/store)
     
-    // CDB 0 Broadcast Interface (Tags Only!)
+    // Scalar CDB Broadcast Interfaces (Tags Only)
     input [RS_TAG_WIDTH-1:0] cdb0_tag,
     input cdb0_valid,
-    
-    // CDB 1 Broadcast Interface (Tags Only!)
     input [RS_TAG_WIDTH-1:0] cdb1_tag,
     input cdb1_valid,
     
+    // Vector CDB Broadcast Interfaces (Tags Only)
+    input [RS_TAG_WIDTH-1:0] vec_cdb0_tag,
+    input vec_cdb0_valid,
+    input [RS_TAG_WIDTH-1:0] vec_cdb1_tag,
+    input vec_cdb1_valid,
+    
     // Predictive Issue Scheduling Interface
     output logic issue_req,
+
     input logic issue_grant,
     
     // RegRead interface (Outputs tags & constants, NOT data)
@@ -76,6 +78,8 @@ module reservation_station #(
         logic [RS_TAG_WIDTH-1:0] src2_tag_val;
         logic src1_ready;
         logic src2_ready;
+        logic src1_is_vec;
+        logic src2_is_vec;
         logic [RS_TAG_WIDTH-1:0] vl_tag_val;
         logic vl_ready;
         logic use_vl;
@@ -105,6 +109,11 @@ module reservation_station #(
     
     reg [RS_TAG_WIDTH-1:0] cdb1_tag_buf;
     reg cdb1_val_buf;
+    
+    reg [RS_TAG_WIDTH-1:0] vec_cdb0_tag_buf;
+    reg vec_cdb0_val_buf;
+    reg [RS_TAG_WIDTH-1:0] vec_cdb1_tag_buf;
+    reg vec_cdb1_val_buf;
 
     // ========================================================================
     // Entry Allocation
@@ -133,6 +142,8 @@ module reservation_station #(
                 rs_entries[i].src2_tag_val <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[i].src1_ready <= 1'b0;
                 rs_entries[i].src2_ready <= 1'b0;
+                rs_entries[i].src1_is_vec <= 1'b0;
+                rs_entries[i].src2_is_vec <= 1'b0;
                 rs_entries[i].dest_tag <= {RS_TAG_WIDTH{1'b0}};
                 rs_entries[i].alu_op_val <= 4'b0;
                 rs_entries[i].lsq_tag <= {LSQ_TAG_WIDTH{1'b0}};
@@ -150,6 +161,10 @@ module reservation_station #(
             cdb0_val_buf <= 1'b0;
             cdb1_tag_buf <= {RS_TAG_WIDTH{1'b0}};
             cdb1_val_buf <= 1'b0;
+            vec_cdb0_tag_buf <= {RS_TAG_WIDTH{1'b0}};
+            vec_cdb0_val_buf <= 1'b0;
+            vec_cdb1_tag_buf <= {RS_TAG_WIDTH{1'b0}};
+            vec_cdb1_val_buf <= 1'b0;
         end 
         else begin
             // 1. Buffer CDB tag (capture transient signal) 
@@ -157,6 +172,10 @@ module reservation_station #(
             cdb0_val_buf <= cdb0_valid;
             cdb1_tag_buf <= cdb1_tag;
             cdb1_val_buf <= cdb1_valid;
+            vec_cdb0_tag_buf <= vec_cdb0_tag;
+            vec_cdb0_val_buf <= vec_cdb0_valid;
+            vec_cdb1_tag_buf <= vec_cdb1_tag;
+            vec_cdb1_val_buf <= vec_cdb1_valid;
 
             // 2. Dispatch - Allocate new entry
             if (dispatch_valid && !rs_full) begin // Cycle N
@@ -175,10 +194,12 @@ module reservation_station #(
                 // Handle Src1
                 rs_entries[alloc_idx].src1_tag_val <= src1_tag;
                 rs_entries[alloc_idx].src1_ready <= src1_valid | !use_rs1_in;
+                rs_entries[alloc_idx].src1_is_vec <= src1_is_vec_in;
 
                 // Handle Src2
                 rs_entries[alloc_idx].src2_tag_val <= src2_tag;
                 rs_entries[alloc_idx].src2_ready <= src2_valid | !use_rs2_in;
+                rs_entries[alloc_idx].src2_is_vec <= src2_is_vec_in;
                 
                 // Handle VL
                 rs_entries[alloc_idx].vl_tag_val <= vl_tag_in;
@@ -189,24 +210,27 @@ module reservation_station #(
             // 3. Update waiting entries using buffered CDB tags
             for (int i = 0; i < RS_SIZE; i++) begin // Cycle N+1
                 if (rs_entries[i].busy) begin
-                    // Check CDB 0
-                    if (cdb0_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == cdb0_tag_buf) begin
-                        rs_entries[i].src1_ready <= 1'b1;
-                    end
-                    if (cdb0_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == cdb0_tag_buf) begin
-                        rs_entries[i].src2_ready <= 1'b1;
-                    end
-                    if (cdb0_val_buf && !rs_entries[i].vl_ready && rs_entries[i].vl_tag_val == cdb0_tag_buf) begin
-                        rs_entries[i].vl_ready <= 1'b1;
+                    // Handle Src1 Snooping
+                    if (rs_entries[i].src1_is_vec) begin
+                        if (vec_cdb0_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == vec_cdb0_tag_buf) rs_entries[i].src1_ready <= 1'b1;
+                        if (vec_cdb1_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == vec_cdb1_tag_buf) rs_entries[i].src1_ready <= 1'b1;
+                    end else begin
+                        if (cdb0_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == cdb0_tag_buf) rs_entries[i].src1_ready <= 1'b1;
+                        if (cdb1_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == cdb1_tag_buf) rs_entries[i].src1_ready <= 1'b1;
                     end
                     
-                    // Check CDB 1
-                    if (cdb1_val_buf && !rs_entries[i].src1_ready && rs_entries[i].src1_tag_val == cdb1_tag_buf) begin
-                        rs_entries[i].src1_ready <= 1'b1;
+                    // Handle Src2 Snooping
+                    if (rs_entries[i].src2_is_vec) begin
+                        if (vec_cdb0_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == vec_cdb0_tag_buf) rs_entries[i].src2_ready <= 1'b1;
+                        if (vec_cdb1_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == vec_cdb1_tag_buf) rs_entries[i].src2_ready <= 1'b1;
+                    end else begin
+                        if (cdb0_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == cdb0_tag_buf) rs_entries[i].src2_ready <= 1'b1;
+                        if (cdb1_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == cdb1_tag_buf) rs_entries[i].src2_ready <= 1'b1;
                     end
-                    if (cdb1_val_buf && !rs_entries[i].src2_ready && rs_entries[i].src2_tag_val == cdb1_tag_buf) begin
-                        rs_entries[i].src2_ready <= 1'b1;
-                    end
+                    
+                    // Handle VL Snooping (Always Scalar)
+                    if (cdb0_val_buf && !rs_entries[i].vl_ready && rs_entries[i].vl_tag_val == cdb0_tag_buf) rs_entries[i].vl_ready <= 1'b1;
+                    if (cdb1_val_buf && !rs_entries[i].vl_ready && rs_entries[i].vl_tag_val == cdb1_tag_buf) rs_entries[i].vl_ready <= 1'b1;
                 end
             end
 

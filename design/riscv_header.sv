@@ -49,6 +49,7 @@ parameter INST_WIDTH = 32;        // Instruction width
 `define VEC_OP_XOR 4'b0101
 `define VEC_OP_SLL 4'b0110
 `define VEC_OP_SRL 4'b0111
+`define VEC_OP_SRA 4'b1011
 `define UNKNOWN_VEC_OP 4'b1111
 
 // Reservation Station Types (for routing in dispatch)

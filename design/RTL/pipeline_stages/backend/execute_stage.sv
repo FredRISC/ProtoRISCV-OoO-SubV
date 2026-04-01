@@ -96,10 +96,15 @@ module execute_stage #(
     output logic [5:0] cdb1_tag,
     output logic cdb1_valid,
 
-    // Vector CDB Broadcast Interface (128-bit)
-    output logic [VLEN-1:0] vec_cdb_result,
-    output logic [5:0] vec_cdb_tag,
-    output logic vec_cdb_valid
+    // Vector CDB 0 (Scheduled - VEU)
+    output logic [DLEN-1:0] vec_cdb0_result,
+    output logic [5:0] vec_cdb0_tag,
+    output logic vec_cdb0_valid,
+    
+    // Vector CDB 1 (Unscheduled - LSQ)
+    output logic [DLEN-1:0] vec_cdb1_result,
+    output logic [5:0] vec_cdb1_tag,
+    output logic vec_cdb1_valid
 );
 
     // ========================================================================
@@ -122,11 +127,14 @@ module execute_stage #(
     logic div_valids [NUM_DIV_FUS-1:0];
     
     // LSU output
-    logic [XLEN-1:0] lsu_result;
+    logic [XLEN-1:0] lsu_scalar_result;
     logic lsu_valid;
+    logic [DLEN-1:0] lsu_vector_result;
+    logic [5:0]      lsu_vector_tag;
+    logic            lsu_vector_valid;
     
     // VEU output
-    logic [XLEN-1:0] vec_result;
+    logic [DLEN-1:0] veu_result;
     logic [5:0] vec_result_tag;
     logic vec_result_valid;
 
@@ -228,7 +236,7 @@ module execute_stage #(
     
     logic [5:0] lsu_tag_extended;
 
-    load_store_queue #(.LSQ_SIZE(16), .XLEN(XLEN)) lsq_inst (
+    load_store_queue #(.LSQ_SIZE(16), .XLEN(XLEN), .DLEN(DLEN)) lsq_inst (
         .clk(clk),
         .rst_n(rst_n),
         .flush(flush), 
@@ -252,9 +260,14 @@ module execute_stage #(
         .exe_store_valid(mem_valid && exe_is_store),
         
         // Result Interface
+        // Scalar Port
         .cdb_phys_tag_out(lsu_tag_extended), 
-        .lsq_data_out(lsu_result),
+        .lsq_data_out(lsu_scalar_result),
         .lsq_out_valid(lsu_valid),
+        // Vector Port
+        .vec_cdb_phys_tag_out(lsu_vector_tag),
+        .vec_lsq_data_out(lsu_vector_result),
+        .vec_lsq_out_valid(lsu_vector_valid),
         
         .commit_lsq(commit_lsq), // Retire load/store
         
@@ -283,10 +296,9 @@ module execute_stage #(
     // ========================================================================
     
     vector_execution_unit #(
-        .VLEN(VLEN),
-        .VLMAX(16),
-        .ELEN(32),
-        .NUM_VEC_LANES(4)
+        .VLEN(`VLEN),
+        .ELEN(`ELEN),
+        .NUM_VEC_LANES(`NUM_VEC_LANES)
     ) veu_inst (
         .clk(clk),
         .rst_n(rst_n),
@@ -296,7 +308,7 @@ module execute_stage #(
         .vec_src2(vec_op2),
         .vec_op(vec_operation),
         .vec_valid(vec_valid),
-        .vec_result(vec_result),
+        .vec_result(veu_result),
         .vec_result_valid(vec_result_valid),
         .vreg_rd_addr(5'b0),
         .vreg_rd_data(),
@@ -373,7 +385,7 @@ module execute_stage #(
     end
 
     // ========================================================================
-    // CDB 0: Scheduled Bus (ALU, MUL, VEU)
+    // CDB 0: Scheduled Bus (ALU, MUL)
     // The issue_scheduler guarantees these will NEVER collide!
     // ========================================================================
     always @(*) begin
@@ -393,7 +405,7 @@ module execute_stage #(
     end
 
     // ========================================================================
-    // CDB 1: Unscheduled Bus (LSQ, DIV)
+    // CDB 1: Unscheduled Bus (LSQ, DIV, VEU)
     // These operate outside the scheduler. LSQ gets priority.
     // (Known edge case: DIV drops data if LSQ hits on the same exact cycle).
     // ========================================================================
@@ -404,7 +416,7 @@ module execute_stage #(
         
         if (lsu_valid) begin
             cdb1_valid = 1'b1;
-            cdb1_result = lsu_result;
+            cdb1_result = lsu_scalar_result;
             cdb1_tag = lsu_tag_extended; 
         end else if (div_result_valid) begin
             cdb1_valid = 1'b1;
@@ -414,38 +426,16 @@ module execute_stage #(
     end
 
     // ========================================================================
-    // Dedicated Vector CDB
+    // Dedicated Vector CDBs
     // ========================================================================
     always @(*) begin
-        vec_cdb_valid = vec_result_valid;
-        vec_cdb_result = vec_result;
-        vec_cdb_tag = vec_result_tag;
+        vec_cdb0_valid = vec_result_valid;
+        vec_cdb0_result = veu_result;
+        vec_cdb0_tag = vec_result_tag;
+        
+        vec_cdb1_valid = lsu_vector_valid;
+        vec_cdb1_result = lsu_vector_result;
+        vec_cdb1_tag = lsu_vector_tag;
     end
 
 endmodule
-
-// ============================================================================
-// BENEFITS OF THIS ENCAPSULATION
-// ============================================================================
-//
-// 1. MODULARITY:
-//    - To add 2nd ALU: Just change NUM_ALU_FUS = 2
-//    - No changes to top module
-//    - CDB arbitration automatically handles multiple sources
-//
-// 2. READABILITY:
-//    - Top module sees only one interface: execute_stage
-//    - No mess of individual FU signals in top
-//    - Data flow clear: RS → execute_stage → CDB
-//
-// 3. SCALABILITY:
-//    - NUM_ALU_FUS, NUM_MUL_FUS, NUM_DIV_FUS parameterized
-//    - Add FUs by just changing parameters
-//    - Generate blocks handle all instances automatically
-//
-// 4. MAINTAINABILITY:
-//    - All FU logic in one place
-//    - CDB arbitration centralized
-//    - Easy to debug execution pipeline
-//
-// ============================================================================

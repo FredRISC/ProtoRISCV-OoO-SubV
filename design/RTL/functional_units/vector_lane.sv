@@ -35,6 +35,7 @@ module vector_lane #(
                 `VEC_OP_XOR:  result <= operand1 ^ operand2;
                 `VEC_OP_SLL:  result <= operand1 << operand2[4:0];
                 `VEC_OP_SRL:  result <= operand1 >> operand2[4:0];
+                `VEC_OP_SRA:  result <= $signed(operand1) >>> operand2[4:0];
                 default:      result <= 32'h0;
             endcase
         end else begin

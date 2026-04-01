@@ -41,6 +41,8 @@ module issue_stage #(
     input [XLEN-1:0] dispatch_vtype,
     input [XLEN-1:0] dispatch_pc,
     input [3:0] dispatch_alu_op,
+    input dispatch_src1_is_vec,
+    input dispatch_src2_is_vec,
     input [RS_TAG_WIDTH-1:0] dispatch_dest_tag,
     input [LSQ_TAG_WIDTH-1:0] dispatch_lsq_tag,
     
@@ -51,8 +53,10 @@ module issue_stage #(
     input cdb0_valid,
     input [RS_TAG_WIDTH-1:0] cdb1_tag,
     input cdb1_valid,
-    input [RS_TAG_WIDTH-1:0] vec_cdb_tag,
-    input vec_cdb_valid,
+    input [RS_TAG_WIDTH-1:0] vec_cdb0_tag,
+    input vec_cdb0_valid,
+    input [RS_TAG_WIDTH-1:0] vec_cdb1_tag,
+    input vec_cdb1_valid,
     
     // --------------------------------------------------------------------
     // FU Ready Handshaking (Classic Tomasulo)
@@ -137,10 +141,12 @@ module issue_stage #(
         .src2_tag(dispatch_src2_tag), .src2_valid(dispatch_src2_valid),
         .use_rs1_in(dispatch_use_rs1), .use_rs2_in(dispatch_use_rs2), .use_pc_in(dispatch_use_pc),
         .vl_tag_in(dispatch_vl_tag), .vl_valid_in(dispatch_vl_valid), .use_vl_in(dispatch_use_vl),
+        .src1_is_vec_in(1'b0), .src2_is_vec_in(1'b0), // ALU uses scalar
         .imm_data(dispatch_imm), .vtype_data(dispatch_vtype), .pc_data(dispatch_pc), .alu_op(dispatch_alu_op),
         .dispatch_valid(dispatch_valid && (dispatch_rs_type == `RS_TYPE_ALU)),
         .dest_tag_in(dispatch_dest_tag), .lsq_tag_in({LSQ_TAG_WIDTH{1'b0}}),
         .cdb0_tag(cdb0_tag), .cdb0_valid(cdb0_valid), .cdb1_tag(cdb1_tag), .cdb1_valid(cdb1_valid),
+        .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_valid(vec_cdb0_valid), .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_valid(vec_cdb1_valid),
         .issue_req(req_alu), .issue_grant(grant_alu),
         .issue_src1_tag(alu_issue_src1_tag), .issue_src2_tag(alu_issue_src2_tag),
         .issue_use_rs1(alu_issue_use_rs1), .issue_use_rs2(alu_issue_use_rs2), .issue_use_pc(alu_issue_use_pc),
@@ -154,10 +160,12 @@ module issue_stage #(
         .src2_tag(dispatch_src2_tag), .src2_valid(dispatch_src2_valid),
         .use_rs1_in(dispatch_use_rs1), .use_rs2_in(dispatch_use_rs2), .use_pc_in(1'b0),
         .vl_tag_in(dispatch_vl_tag), .vl_valid_in(dispatch_vl_valid), .use_vl_in(dispatch_use_vl),
+        .src1_is_vec_in(1'b0), .src2_is_vec_in(dispatch_src2_is_vec), // MEM might use vector for store data
         .imm_data(dispatch_imm), .vtype_data(dispatch_vtype), .pc_data(dispatch_pc), .alu_op(dispatch_alu_op),
         .dispatch_valid(dispatch_valid && (dispatch_rs_type == `RS_TYPE_MEM)),
         .dest_tag_in(dispatch_dest_tag), .lsq_tag_in(dispatch_lsq_tag),
         .cdb0_tag(cdb0_tag), .cdb0_valid(cdb0_valid), .cdb1_tag(cdb1_tag), .cdb1_valid(cdb1_valid),
+        .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_valid(vec_cdb0_valid), .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_valid(vec_cdb1_valid),
         .issue_req(), .issue_grant(mem_fu_ready), // Unscheduled bus
         .issue_src1_tag(mem_issue_src1_tag), .issue_src2_tag(mem_issue_src2_tag),
         .issue_use_rs1(mem_issue_use_rs1), .issue_use_rs2(mem_issue_use_rs2), .issue_use_pc(), .issue_use_vl(mem_issue_use_vl),
@@ -171,10 +179,12 @@ module issue_stage #(
         .src2_tag(dispatch_src2_tag), .src2_valid(dispatch_src2_valid),
         .use_rs1_in(1'b1), .use_rs2_in(1'b1), .use_pc_in(1'b0), // MUL always uses registers
         .vl_tag_in(dispatch_vl_tag), .vl_valid_in(dispatch_vl_valid), .use_vl_in(dispatch_use_vl),
+        .src1_is_vec_in(1'b0), .src2_is_vec_in(1'b0),
         .imm_data(dispatch_imm), .vtype_data(dispatch_vtype), .pc_data(dispatch_pc), .alu_op(dispatch_alu_op),
         .dispatch_valid(dispatch_valid && (dispatch_rs_type == `RS_TYPE_MUL)),
         .dest_tag_in(dispatch_dest_tag), .lsq_tag_in({LSQ_TAG_WIDTH{1'b0}}),
         .cdb0_tag(cdb0_tag), .cdb0_valid(cdb0_valid), .cdb1_tag(cdb1_tag), .cdb1_valid(cdb1_valid),
+        .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_valid(vec_cdb0_valid), .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_valid(vec_cdb1_valid),
         .issue_req(req_mul), .issue_grant(grant_mul),
         .issue_src1_tag(mul_issue_src1_tag), .issue_src2_tag(mul_issue_src2_tag),
         .execute_op(mul_issue_op), .execute_valid(mul_issue_valid), .rs_full(mul_rs_full), .assigned_tag(mul_issue_dest_tag)
@@ -186,10 +196,12 @@ module issue_stage #(
         .src2_tag(dispatch_src2_tag), .src2_valid(dispatch_src2_valid),
         .use_rs1_in(1'b1), .use_rs2_in(1'b1), .use_pc_in(1'b0), // DIV always uses registers
         .vl_tag_in(dispatch_vl_tag), .vl_valid_in(dispatch_vl_valid), .use_vl_in(dispatch_use_vl),
+        .src1_is_vec_in(1'b0), .src2_is_vec_in(1'b0),
         .imm_data(dispatch_imm), .vtype_data(dispatch_vtype), .pc_data(dispatch_pc), .alu_op(dispatch_alu_op),
         .dispatch_valid(dispatch_valid && (dispatch_rs_type == `RS_TYPE_DIV)),
         .dest_tag_in(dispatch_dest_tag), .lsq_tag_in({LSQ_TAG_WIDTH{1'b0}}),
         .cdb0_tag(cdb0_tag), .cdb0_valid(cdb0_valid), .cdb1_tag(cdb1_tag), .cdb1_valid(cdb1_valid),
+        .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_valid(vec_cdb0_valid), .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_valid(vec_cdb1_valid),
         .issue_req(), .issue_grant(div_fu_ready), // Unscheduled bus
         .issue_src1_tag(div_issue_src1_tag), .issue_src2_tag(div_issue_src2_tag),
         .execute_op(div_issue_op), .execute_valid(div_issue_valid), .rs_full(div_rs_full), .assigned_tag(div_issue_dest_tag)
@@ -201,10 +213,12 @@ module issue_stage #(
         .src2_tag(dispatch_src2_tag), .src2_valid(dispatch_src2_valid),
         .use_rs1_in(1'b1), .use_rs2_in(1'b1), .use_pc_in(1'b0),
         .vl_tag_in(dispatch_vl_tag), .vl_valid_in(dispatch_vl_valid), .use_vl_in(dispatch_use_vl),
+        .src1_is_vec_in(dispatch_src1_is_vec), .src2_is_vec_in(dispatch_src2_is_vec), // VEC uses vector operands
         .imm_data(dispatch_imm), .vtype_data(dispatch_vtype), .pc_data(dispatch_pc), .alu_op(dispatch_alu_op),
         .dispatch_valid(dispatch_valid && (dispatch_rs_type == `RS_TYPE_VEC)),
         .dest_tag_in(dispatch_dest_tag), .lsq_tag_in({LSQ_TAG_WIDTH{1'b0}}),
-        .cdb0_tag(vec_cdb_tag), .cdb0_valid(vec_cdb_valid), .cdb1_tag({RS_TAG_WIDTH{1'b0}}), .cdb1_valid(1'b0),
+        .cdb0_tag(cdb0_tag), .cdb0_valid(cdb0_valid), .cdb1_tag(cdb1_tag), .cdb1_valid(cdb1_valid),
+        .vec_cdb0_tag(vec_cdb0_tag), .vec_cdb0_valid(vec_cdb0_valid), .vec_cdb1_tag(vec_cdb1_tag), .vec_cdb1_valid(vec_cdb1_valid),
         .issue_req(), .issue_grant(vec_fu_ready), // Unscheduled bus
         .issue_src1_tag(vec_issue_src1_tag), .issue_src2_tag(vec_issue_src2_tag), .issue_use_vl(vec_issue_use_vl),
         .issue_vl_tag(vec_issue_vl_tag), .issue_vtype(vec_issue_vtype),
