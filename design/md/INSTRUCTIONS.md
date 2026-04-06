@@ -187,6 +187,6 @@ BEQ, BNE, BLT, BGE, BLTU, BGEU + JAL, JALR
 MUL, MULH, MULHSU, MULHU, DIV, DIVU, REM, REMU
 
 ### Vector (15+)
-VSETVLI, VADD, VSUB, VMUL, VDIV, VAND, VOR, VXOR, shifts, reductions, load/store
+VSETVLI, VADD, VSUB, VMUL, VDIV, VAND, VOR, VXOR, shifts, load/store
 
 **Total: ~50 instructions supported**
