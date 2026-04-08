@@ -1,4 +1,4 @@
-# ProtoRISC: Out-of-Order RV32IM-SubV Processor
+# ProtoRISCV: Out-of-Order RV32IM-SubV Processor
 
 ProtoRISC is a single-issue, speculatively-renamed, Out-of-Order RISC-V processor prototype, supporting the **RV32IM** base integer instruction set alongside a tightly-coupled Vector Coprocessor implementing a targeted subset of the **Zve32x** Vector Extension.
 
