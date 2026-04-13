@@ -15,6 +15,8 @@ This project serves as a comprehensive study of OoO RISC-V architecture and a fo
 * **Vector Coprocessor (`VLEN=128`):** A 4-lane Vector Execution Unit processes 128-bit blocks. Vector length (`vl`) and type (`vtype`) are dynamically tracked through the pipeline as physical dependencies.
 * **Vector-Aware Load/Store Queue (LSQ):** Out-of-Order memory subsystem featuring combinational memory disambiguation and Store-to-Load Forwarding. An embedded FSM automatically bridges the 128-bit Vector datapath with the 32-bit memory interface.
 
+##### A separate L1 Cache module with MSHR feature is also provided. (under construction)
+
 ---
 
 ## Quick Start & Verification
